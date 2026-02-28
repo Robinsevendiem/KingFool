@@ -20,7 +20,7 @@ def update_data(token):
     Update ETF data using Tushare.
     """
     try:
-        # ts.set_token(token)
+        ts.set_token(token)
         pro = ts.pro_api(token)
     except Exception as e:
         st.error(f"Tushare 初始化失败: {e}")
@@ -61,7 +61,13 @@ def update_data(token):
         if os.path.exists(filename):
             try:
                 existing_df = pd.read_csv(filename)
-                existing_df['trade_date'] = pd.to_datetime(existing_df['trade_date'], format='%Y%m%d')
+                # Ensure correct datetime parsing
+                if 'trade_date' in existing_df.columns:
+                    try:
+                        existing_df['trade_date'] = pd.to_datetime(existing_df['trade_date'], format='%Y%m%d')
+                    except:
+                        existing_df['trade_date'] = pd.to_datetime(existing_df['trade_date'])
+                        
                 if not existing_df.empty:
                     last_date = existing_df['trade_date'].max()
                     start_date = (last_date + timedelta(days=1)).strftime('%Y%m%d')
@@ -73,10 +79,20 @@ def update_data(token):
             logs.append(f"{name}: 数据已是最新。")
         else:
             try:
-                # Fetch unadjusted
-                df_raw = ts.pro_bar(ts_code=code, start_date=start_date, end_date=today, adj=None, asset='FD')
-                # Fetch adjusted (qfq)
-                df_adj = ts.pro_bar(ts_code=code, start_date=start_date, end_date=today, adj='qfq', asset='FD')
+                # Use retry logic
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        # Fetch unadjusted
+                        df_raw = ts.pro_bar(ts_code=code, start_date=start_date, end_date=today, adj=None, asset='FD')
+                        # Fetch adjusted (qfq)
+                        df_adj = ts.pro_bar(ts_code=code, start_date=start_date, end_date=today, adj='qfq', asset='FD')
+                        
+                        break # Success
+                    except Exception as e:
+                        if attempt == max_retries - 1:
+                            raise e
+                        time.sleep(1)
                 
                 if df_raw is not None and not df_raw.empty:
                     if df_adj is None or df_adj.empty:
