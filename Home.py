@@ -546,6 +546,12 @@ def get_strategy_params():
             ts_token = st.secrets["TUSHARE_TOKEN"]
     except:
         pass
+        
+    # Allow manual override
+    manual_token = st.sidebar.text_input("Tushare Token (可选)", value="", type="password", help="如果自动获取失败，请在此手动输入 Token")
+    if manual_token:
+        ts_token = manual_token
+        st.session_state['tushare_token'] = manual_token
     
     if st.sidebar.button("🔄 更新数据"):
         with st.spinner("正在连接 Tushare 更新数据..."):
@@ -621,7 +627,19 @@ def render_latest_holding_page():
         except:
             pass
         
+        # Check sidebar override (params are loaded from sidebar)
+        # But get_strategy_params runs in sidebar and returns params dict.
+        # It doesn't return the token.
+        # So we can't easily access the manual token from sidebar here unless we store it in session state.
+        
+        # Let's add session state logic for token
+        if 'tushare_token' in st.session_state and st.session_state['tushare_token']:
+             ts_token = st.session_state['tushare_token']
+        
         with st.spinner("正在同步最新市场数据..."):
+            if 'tushare_token' in st.session_state and st.session_state['tushare_token']:
+                 ts_token = st.session_state['tushare_token']
+            
             update_data(ts_token)
             load_history_data.clear()
             precalculate_all_scores.clear()

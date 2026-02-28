@@ -4,3 +4,4 @@ numpy
 plotly
 tushare
 scipy
+statsmodels
