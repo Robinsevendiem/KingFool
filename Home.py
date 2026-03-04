@@ -14,10 +14,13 @@ warnings.filterwarnings('ignore')
 # --- Page Config ---
 st.set_page_config(page_title="ETF 动量策略回测系统", layout="wide", page_icon="📈")
 
+import statsmodels.api as sm
+
 # --- Helper: Data Update ---
-def update_data(token):
+def update_data(token, force=False):
     """
     Update ETF data using Tushare.
+    force: If True, re-download all data from scratch.
     """
     try:
         ts.set_token(token)
@@ -58,7 +61,7 @@ def update_data(token):
         start_date = etf['start_date']
         existing_df = None
         
-        if os.path.exists(filename):
+        if not force and os.path.exists(filename):
             try:
                 existing_df = pd.read_csv(filename)
                 # Ensure correct datetime parsing
@@ -75,7 +78,7 @@ def update_data(token):
                 logs.append(f"读取现有文件 {filename} 失败: {e}")
         
         # Fetch Data
-        if start_date > today:
+        if not force and start_date > today:
             logs.append(f"{name}: 数据已是最新。")
         else:
             try:
@@ -235,11 +238,78 @@ def calculate_rolling_scores(series, window=20):
 def precalculate_all_scores(history_data, window=20):
     all_scores = pd.DataFrame()
     for asset, df in history_data.items():
-        if 'close' in df.columns:
-            scores = calculate_rolling_scores(df['close'], window=window)
-            scores.name = asset
-            all_scores = pd.merge(all_scores, scores, left_index=True, right_index=True, how='outer')
+        # Prefer adjusted close
+        if 'adj_close' in df.columns:
+            series = df['adj_close']
+        elif 'close' in df.columns:
+            series = df['close']
+        else:
+            continue
+            
+        scores = calculate_rolling_scores(series, window=window)
+        scores.name = asset
+        all_scores = pd.merge(all_scores, scores, left_index=True, right_index=True, how='outer')
     return all_scores
+
+@st.cache_data
+def calculate_rsrs_score(df, N=18, M=600):
+    """
+    Calculate RSRS Z-Score.
+    N: Regression Window
+    M: Standardization Window
+    """
+    if 'adj_high' in df.columns and 'adj_low' in df.columns:
+        highs = df['adj_high']
+        lows = df['adj_low']
+    elif 'high' in df.columns and 'low' in df.columns:
+        highs = df['high']
+        lows = df['low']
+    else:
+        return None
+        
+    values_high = highs.values
+    values_low = lows.values
+    
+    beta_series = np.full(len(df), np.nan)
+    
+    # Calculate Betas (Rolling Regression)
+    # We only need the last beta if M is large, but to calculate Z-Score we need M betas.
+    # So we need to calculate at least M+N betas back.
+    # For efficiency, if len(df) is huge, we can trim? No, cache handles it.
+    
+    for i in range(N, len(df) + 1):
+        y = values_high[i-N:i]
+        x = values_low[i-N:i]
+        
+        # Simple check for NaNs
+        if np.isnan(x).any() or np.isnan(y).any():
+            continue
+            
+        try:
+            # Using numpy polyfit is faster than statsmodels for simple linear regression
+            coeffs = np.polyfit(x, y, 1)
+            beta = coeffs[0]
+            beta_series[i-1] = beta
+        except:
+            pass
+            
+    # Calculate Z-Score
+    betas = pd.Series(beta_series, index=df.index)
+    mean_beta = betas.rolling(M).mean()
+    std_beta = betas.rolling(M).std()
+    z_score = (betas - mean_beta) / std_beta
+    
+    return z_score
+
+@st.cache_data
+def precalculate_all_rsrs(history_data):
+    all_rsrs = pd.DataFrame()
+    for asset, df in history_data.items():
+        rsrs = calculate_rsrs_score(df)
+        if rsrs is not None:
+            rsrs.name = asset
+            all_rsrs = pd.merge(all_rsrs, rsrs, left_index=True, right_index=True, how='outer')
+    return all_rsrs
 
 # --- 2. Backtest Logic ---
 
@@ -270,14 +340,31 @@ def run_backtest(history_data, raw_scores_df, params):
     current_asset = '现金'
     target_asset = '现金' # Signal from yesterday
     
-    # Cache Prices & Returns for Speed
-    price_open = {asset: df['open'] for asset, df in history_data.items()}
-    price_close = {asset: df['close'] for asset, df in history_data.items()}
+    # Cache Prices & Returns for Speed (Use Adjusted if available for Backtest to avoid Split Crashes)
+    # Note: Using Adjusted prices for backtest execution preserves % returns but "Price" in logs will be adjusted.
+    price_open = {}
+    price_close = {}
+    price_high = {}
+    price_low = {}
+    
+    for asset, df in history_data.items():
+        if 'adj_open' in df.columns and 'adj_close' in df.columns:
+            price_open[asset] = df['adj_open']
+            price_close[asset] = df['adj_close']
+            price_high[asset] = df['adj_high'] if 'adj_high' in df.columns else df['high']
+            price_low[asset] = df['adj_low'] if 'adj_low' in df.columns else df['low']
+        else:
+            price_open[asset] = df['open']
+            price_close[asset] = df['close']
+            price_high[asset] = df['high']
+            price_low[asset] = df['low']
     
     daily_returns = {}
     if params['crash_filter_enabled']:
         for asset, df in history_data.items():
-            daily_returns[asset] = df['close'].pct_change()
+            # Use same price series as execution
+            if asset in price_close:
+                 daily_returns[asset] = price_close[asset].pct_change()
     
     value_history = []
     trade_log = []
@@ -316,10 +403,16 @@ def run_backtest(history_data, raw_scores_df, params):
             
             # Calculate trade return
             trade_return_pct = 0.0
+            pnl_amount = 0.0
+            
             if current_asset in cost_basis:
-                buy_price = cost_basis[current_asset]
-                if buy_price > 0:
-                    trade_return_pct = (price - buy_price) / buy_price
+                avg_buy_cost = cost_basis[current_asset]
+                if avg_buy_cost > 0:
+                    # Trade Return % (based on price movement, rough approx or exact?)
+                    # Let's use money-weighted: (Proceeds - Cost) / Cost
+                    total_buy_cost = shares * avg_buy_cost
+                    pnl_amount = proceeds - total_buy_cost
+                    trade_return_pct = pnl_amount / total_buy_cost
                 del cost_basis[current_asset]
             
             trade_log.append({
@@ -331,7 +424,8 @@ def run_backtest(history_data, raw_scores_df, params):
                 'amount': proceeds,
                 'fee': shares * price * params['fee_rate'],
                 'return_pct': cum_ret_pct,
-                'trade_return': trade_return_pct
+                'trade_return': trade_return_pct,
+                'pnl_amount': pnl_amount
             })
             current_asset = '现金'
             
@@ -343,7 +437,9 @@ def run_backtest(history_data, raw_scores_df, params):
             cost = shares * price * (1 + params['fee_rate'])
             cash -= cost
             holdings[target_asset] = shares
-            cost_basis[target_asset] = price
+            
+            # Record average cost per share (including fee) for PnL calculation
+            cost_basis[target_asset] = cost / shares
             
             trade_log.append({
                 'date': date,
@@ -354,13 +450,18 @@ def run_backtest(history_data, raw_scores_df, params):
                 'amount': cost,
                 'fee': shares * price * params['fee_rate'],
                 'return_pct': cum_ret_pct,
-                'trade_return': np.nan
+                'trade_return': np.nan,
+                'pnl_amount': np.nan
             })
             current_asset = target_asset
             
         # --- B. Valuation (At Close) ---
         day_value = cash
+        day_high = cash
+        day_low = cash
+        
         for asset, shares in holdings.items():
+            # Close
             if date in price_close[asset].index:
                 price = price_close[asset].loc[date]
             else:
@@ -370,7 +471,29 @@ def run_backtest(history_data, raw_scores_df, params):
                     price = 0
             day_value += shares * price
             
-        value_history.append({'date': date, 'value': day_value, 'holding': current_asset})
+            # High
+            if date in price_high[asset].index:
+                ph = price_high[asset].loc[date]
+            else:
+                try: ph = price_high[asset].asof(date)
+                except: ph = 0
+            day_high += shares * ph
+            
+            # Low
+            if date in price_low[asset].index:
+                pl = price_low[asset].loc[date]
+            else:
+                try: pl = price_low[asset].asof(date)
+                except: pl = 0
+            day_low += shares * pl
+            
+        value_history.append({
+            'date': date, 
+            'value': day_value, 
+            'high': day_high,
+            'low': day_low,
+            'holding': current_asset
+        })
         
         # --- C. Signal Generation (At Close) ---
         if date not in raw_scores_df.index:
@@ -415,8 +538,33 @@ def run_backtest(history_data, raw_scores_df, params):
                     next_target = '现金'
                 else:
                     # 2. Filter Candidates (Score > 0 & <= Cutoff)
+                    # Use Asset-Specific Cutoff
+                    
+                    # We need to map asset name to code again to lookup config
+                    name_to_code = {
+                        '日经ETF': '513520.SH', '纳指ETF': '513100.SH', '港股科技ETF': '513020.SH', 
+                        '港股科技': '513020.SH', '纳指100': '513100.SH',
+                        '180ETF': '510180.SH', '上证180': '510180.SH',
+                        '科创板ETF': '588120.SH', '科创板': '588120.SH',
+                        '创业板ETF': '159915.SZ', '创业板': '159915.SZ',
+                        '南方原油(LOF)': '501018.SH', '南方原油': '501018.SH',
+                        '黄金ETF': '518880.SH', 
+                        '30年国债ETF': '511090.SH', '30年国债': '511090.SH'
+                    }
+                    
+                    def get_cutoff(asset_name):
+                        code = name_to_code.get(asset_name)
+                        if code and code in params['user_cutoffs']:
+                            return params['user_cutoffs'][code]
+                        return 300 # Fallback default
+                        
+                    # Vectorized cutoff check? Hard with dict lookup. Loop is easier for candidates.
+                    # Or apply map to index
+                    
+                    current_cutoffs = pd.Series(pool_scores.index.map(get_cutoff), index=pool_scores.index)
+                    
                     valid_candidates = pool_scores[
-                        (pool_scores <= params['cutoff_score']) & (pool_scores > 0)
+                        (pool_scores <= current_cutoffs) & (pool_scores > 0)
                     ]
                     
                     if valid_candidates.empty:
@@ -461,6 +609,75 @@ def run_backtest(history_data, raw_scores_df, params):
     return pd.DataFrame(value_history).set_index('date'), pd.DataFrame(trade_log), timeline, last_signal_info
 
 # --- 3. UI Layout ---
+
+def plot_asset_trades(asset_name, df_ohlc, trades, start_date, end_date):
+    """
+    Generate Close Price chart with Buy/Sell markers.
+    """
+    # Filter OHLC by date range
+    mask = (df_ohlc.index >= pd.Timestamp(start_date)) & (df_ohlc.index <= pd.Timestamp(end_date))
+    chart_data = df_ohlc.loc[mask]
+    
+    if chart_data.empty:
+        return None
+
+    # Determine which columns to use (match backtest logic preference for Adjusted)
+    if 'adj_close' in chart_data.columns:
+        c = chart_data['adj_close']
+        price_type = "(后复权)"
+    else:
+        c = chart_data['close']
+        price_type = "(未复权)"
+
+    # Line Chart
+    fig = go.Figure()
+    
+    fig.add_trace(go.Scatter(
+        x=chart_data.index,
+        y=c,
+        mode='lines',
+        name=f'收盘价 {price_type}',
+        line=dict(color='#1f77b4', width=2)
+    ))
+
+    # Buy Markers
+    buy_trades = trades[trades['action'] == '买入']
+    if not buy_trades.empty:
+        fig.add_trace(go.Scatter(
+            x=buy_trades['date'],
+            y=buy_trades['price'],
+            mode='markers',
+            marker=dict(symbol='triangle-up', size=12, color='red', line=dict(width=1, color='black')),
+            name='买入点',
+            hovertext=buy_trades['price'].apply(lambda x: f"买入价: {x:.3f}")
+        ))
+
+    # Sell Markers
+    sell_trades = trades[trades['action'] == '卖出']
+    if not sell_trades.empty:
+        hover_texts = []
+        for _, row in sell_trades.iterrows():
+            ret_str = f"{row['trade_return']:.2%}" if pd.notnull(row['trade_return']) else "N/A"
+            pnl_str = f"{row['pnl_amount']:.2f}" if pd.notnull(row['pnl_amount']) else "N/A"
+            hover_texts.append(f"卖出价: {row['price']:.3f}<br>本次收益率: {ret_str}<br>本次盈亏额: {pnl_str}")
+            
+        fig.add_trace(go.Scatter(
+            x=sell_trades['date'],
+            y=sell_trades['price'], 
+            mode='markers',
+            marker=dict(symbol='triangle-down', size=12, color='green', line=dict(width=1, color='black')),
+            name='卖出点',
+            hovertext=hover_texts
+        ))
+
+    fig.update_layout(
+        title=f"{asset_name} 交易复盘 {price_type}",
+        xaxis_title="日期",
+        yaxis_title="价格",
+        height=500,
+        hovermode="closest"
+    )
+    return fig
 
 def render_intro_page():
     st.title("📚 策略原理与交易者指南")
@@ -570,8 +787,15 @@ def get_strategy_params():
         st.session_state['tushare_token'] = manual_token
     
     if st.sidebar.button("🔄 更新数据"):
+        # Add a force update checkbox logic or just detect if user wants to force?
+        # Since button is stateless, we can add a checkbox before it.
+        pass # Logic moved below
+
+    force_update = st.sidebar.checkbox("强制全量更新 (修复数据分裂/缺失)", value=False, help="勾选后将删除现有数据并重新下载所有历史数据。如果发现价格图表有异常缺口，请使用此功能。")
+    
+    if st.sidebar.button("🔄 执行更新"):
         with st.spinner("正在连接 Tushare 更新数据..."):
-            if update_data(ts_token):
+            if update_data(ts_token, force=force_update):
                 st.success("数据更新成功！请刷新页面或重新回测。")
                 # Clear cache to force reload
                 load_history_data.clear()
@@ -593,8 +817,58 @@ def get_strategy_params():
     
     # Strategy Params
     st.sidebar.subheader("核心参数")
+    
     window = st.sidebar.number_input("动量窗口 (天)", min_value=5, max_value=60, value=20, step=1)
-    cutoff_score = st.sidebar.number_input("过热熔断阈值 (分数)", min_value=50, max_value=1000, value=700, step=10)
+    
+    # Custom Cutoff Logic
+    st.sidebar.markdown("**过热熔断阈值设置**")
+    
+    cutoff_mode = st.sidebar.radio(
+        "阈值模式", 
+        ["分标的独立设置", "全局统一设置"],
+        index=1,
+        help="选择'全局统一'将对所有标的使用相同阈值；选择'分标的独立'可为不同波动率的资产设置不同阈值。"
+    )
+    
+    user_cutoffs = {}
+    
+    # Map code to friendly name for display
+    code_to_name = {
+        '588120.SH': '科创板',
+        '513100.SH': '纳指100',
+        '513520.SH': '日经ETF',
+        '159915.SZ': '创业板',
+        '513020.SH': '港股科技',
+        '510180.SH': '上证180',
+        '518880.SH': '黄金ETF',
+        '501018.SH': '南方原油',
+        '511090.SH': '30年国债'
+    }
+
+    if cutoff_mode == "全局统一设置":
+        global_cutoff = st.sidebar.number_input("全局熔断阈值", min_value=50, max_value=2000, value=700, step=50)
+        for code in code_to_name.keys():
+            user_cutoffs[code] = global_cutoff
+    else:
+        # Default initial values based on statistical analysis
+        default_cutoffs = {
+            '588120.SH': 500,  # 科创板
+            '513100.SH': 600,  # 纳指100
+            '513520.SH': 300,  # 日经ETF
+            '159915.SZ': 1000, # 创业板
+            '513020.SH': 400,  # 港股科技
+            '510180.SH': 600,  # 上证180
+            '518880.SH': 500,  # 黄金ETF
+            '501018.SH': 1000, # 南方原油
+            '511090.SH': 300,  # 30年国债
+        }
+        
+        with st.sidebar.expander("自定义各标的阈值", expanded=True):
+            for code, name in code_to_name.items():
+                default_val = default_cutoffs.get(code, 300)
+                val = st.number_input(f"{name} ({code})", min_value=50, max_value=2000, value=default_val, step=50)
+                user_cutoffs[code] = val
+            
     buffer_score = st.sidebar.number_input("换仓缓冲阈值 (分差)", min_value=0.0, max_value=50.0, value=8.0, step=0.5)
     
     # Crash Filter Params
@@ -616,13 +890,13 @@ def get_strategy_params():
         'start_date': start_date,
         'end_date': end_date,
         'window': window,
-        'cutoff_score': cutoff_score,
+        'user_cutoffs': user_cutoffs,
         'buffer_score': buffer_score,
         'fee_rate': fee_rate,
         'initial_capital': initial_capital,
         'crash_filter_enabled': crash_filter_enabled,
         'crash_window': crash_window,
-        'crash_threshold': crash_threshold
+        'crash_threshold': crash_threshold,
     }
 
 def render_latest_holding_page():
@@ -656,7 +930,8 @@ def render_latest_holding_page():
             if 'tushare_token' in st.session_state and st.session_state['tushare_token']:
                  ts_token = st.session_state['tushare_token']
             
-            update_data(ts_token)
+            # Default to incremental update for "Latest Holding" check
+            update_data(ts_token, force=False)
             load_history_data.clear()
             precalculate_all_scores.clear()
             
@@ -664,6 +939,7 @@ def render_latest_holding_page():
         with st.spinner("正在计算策略信号..."):
             history_data = load_history_data()
             scores_df = precalculate_all_scores(history_data, window=params['window'])
+            rsrs_df = precalculate_all_rsrs(history_data)
             
             # 3. Run Backtest to determine state
             # We run from a reasonable past date to ensure state is correct
@@ -710,22 +986,116 @@ def render_latest_holding_page():
                 # Format for display
                 details = []
                 for asset, score in today_scores.items():
-                    # Check if valid (Crash filter etc)
-                    # We need to replicate the filter logic or just show raw score
-                    # Let's show raw score and highlight
+                    # Get cutoff for this asset
+                    cutoff = 300
+                    if 'user_cutoffs' in params:
+                        # Need to find code
+                        # name_to_code is local in backtest func, recreate or use simple lookup
+                        # We don't have code here easily without re-mapping.
+                        # Let's just do a quick lookup
+                        pass # Cutoff might be slightly off in display if we don't map, but acceptable for now or fix properly.
+                        
+                    # Re-map for accurate cutoff display
+                    name_to_code_disp = {
+                        '日经ETF': '513520.SH', '纳指ETF': '513100.SH', '港股科技ETF': '513020.SH', 
+                        '港股科技': '513020.SH', '纳指100': '513100.SH',
+                        '180ETF': '510180.SH', '上证180': '510180.SH',
+                        '科创板ETF': '588120.SH', '科创板': '588120.SH',
+                        '创业板ETF': '159915.SZ', '创业板': '159915.SZ',
+                        '南方原油(LOF)': '501018.SH', '南方原油': '501018.SH',
+                        '黄金ETF': '518880.SH', 
+                        '30年国债ETF': '511090.SH', '30年国债': '511090.SH'
+                    }
+                    
+                    cutoff_val = 300
+                    asset_code = name_to_code_disp.get(asset)
+                    if asset_code and 'user_cutoffs' in params and asset_code in params['user_cutoffs']:
+                        cutoff_val = params['user_cutoffs'][asset_code]
+                        
                     status = "✅ 候选"
-                    if score > params['cutoff_score']:
-                        status = "🚫 过热熔断"
+                    if score > cutoff_val:
+                        status = f"🚫 过热 (>{cutoff_val})"
                     elif score <= 0:
                         status = "📉 负动量"
+                        
+                    # Get RSRS
+                    rsrs_val = np.nan
+                    if latest_date in rsrs_df.index and asset in rsrs_df.columns:
+                        rsrs_val = rsrs_df.loc[latest_date, asset]
+                        
+                    rsrs_str = f"{rsrs_val:.2f}" if not np.isnan(rsrs_val) else "-"
+                    
+                    # RSRS Status
+                    rsrs_status = ""
+                    if not np.isnan(rsrs_val):
+                        if rsrs_val > 0.7:
+                            rsrs_status = "🔥 强势"
+                        elif rsrs_val < -0.7:
+                            rsrs_status = "🧊 弱势"
+                        else:
+                            rsrs_status = "↔️ 震荡"
                         
                     details.append({
                         '标的': asset,
                         '动量得分': f"{score:.1f}",
+                        'RSRS指标': f"{rsrs_str} {rsrs_status}",
+                        '熔断阈值': cutoff_val,
                         '状态': status
                     })
                 
                 st.dataframe(pd.DataFrame(details))
+
+def calculate_thermometer(df):
+    """
+    Calculate Strategy Thermometer Indicator.
+    Input df must have 'high', 'low', 'value' (as close) columns.
+    """
+    # 1. 计算价格源 hlcc4 (Using 'value' as close)
+    # Ensure columns exist, 'value' is close
+    c = df['value']
+    h = df['high']
+    l = df['low']
+    
+    src = (h + l + c * 2) / 4 
+    
+    # 2. 计算 RSI (采用 RMA 平滑) 
+    def rma(series, period): 
+        return series.ewm(alpha=1/period, adjust=False).mean() 
+    
+    delta = src.diff() 
+    up = rma(delta.clip(lower=0), 14) 
+    down = rma(-delta.clip(upper=0), 14) 
+    rsi = 100 - (100 / (1 + up / down)) 
+    
+    # 3. 计算 TSI (价格与时间的相关系数) 
+    # Use integer index for correlation
+    # We can create a temporary series
+    tsi_window = 14
+    
+    # Rolling correlation requires Series
+    # We correlate src with a rolling window of indices?
+    # No, rolling correlation between two series.
+    # We need a series that represents time.
+    # If df has datetime index, we can't correlate directly with that easily in rolling.
+    # Create a 0..N series
+    time_idx = pd.Series(np.arange(len(df)), index=df.index)
+    
+    tsi = src.rolling(window=tsi_window).corr(time_idx)
+    tsi_norm = (tsi + 1) / 2 * 100 
+    
+    # 4. 计算 BB%B (布林带百分比) 
+    sma_bb = src.rolling(window=20).mean() 
+    std_bb = src.rolling(window=20).std() 
+    bb_percent = (src - (sma_bb - 2 * std_bb)) / (4 * std_bb) * 100 
+    bb_percent = bb_percent.clip(0, 100) 
+
+    # 5. 最终加权合成 (线性) 
+    thermometer = (rsi * 0.45) + (tsi_norm * 0.26) + (bb_percent * 0.29) 
+    
+    # 6. 3日SMA平滑 
+    plot_line = thermometer.rolling(window=3).mean() 
+    
+    return thermometer, plot_line
 
 def render_backtest_page():
     # Sidebar Controls
@@ -742,158 +1112,506 @@ def render_backtest_page():
         with st.spinner("正在执行回测..."):
             df_res, df_trades, timeline, last_signal = run_backtest(history_data, scores_df, params)
             
-            if df_res is None or df_res.empty:
-                st.error("该时间段内无数据或回测失败。")
-            else:
-                # Calculate daily cumulative return
-                df_res['cum_return'] = df_res['value'] / params['initial_capital'] - 1
+            # Store results in session state
+            st.session_state['bt_results'] = {
+                'df_res': df_res,
+                'df_trades': df_trades,
+                'timeline': timeline,
+                'last_signal': last_signal,
+                'scores_df': scores_df,
+                'params': params
+            }
 
-                # --- Metrics Calculation ---
-                total_ret = df_res['value'].iloc[-1] / df_res['value'].iloc[0] - 1
-                days = (df_res.index[-1] - df_res.index[0]).days
-                if days > 0:
-                    ann_ret = (1 + total_ret) ** (365 / days) - 1
-                else:
-                    ann_ret = 0
-                
-                # Volatility
-                daily_ret = df_res['value'].pct_change().dropna()
-                vol = daily_ret.std() * np.sqrt(252)
-                
-                # Sharpe
-                risk_free = 0.02
-                sharpe = (ann_ret - risk_free) / vol if vol != 0 else 0
-                
-                # Max Drawdown
-                cum_max = df_res['value'].cummax()
-                drawdown = (df_res['value'] - cum_max) / cum_max
-                max_dd = drawdown.min()
-                current_dd = drawdown.iloc[-1]
-                
-                # --- Display Metrics ---
-                st.markdown("### 📊 回测绩效概览")
-                col1, col2, col3, col4, col5 = st.columns(5)
-                col1.metric("总收益率", f"{total_ret:.2%}", delta_color="normal")
-                col2.metric("年化收益率", f"{ann_ret:.2%}", delta_color="normal")
-                col3.metric("夏普比率", f"{sharpe:.2f}")
-                col4.metric("最大回撤", f"{max_dd:.2%}", delta_color="inverse")
-                col5.metric("年化波动率", f"{vol:.2%}", delta_color="inverse")
-                
-                st.divider()
-                
-                # --- NEW SECTION: Current Status Info ---
-                # 1. Data Updated To
-                latest_data_date = timeline[-1].strftime('%Y-%m-%d')
-                
-                # 2. T+1 Holding
-                next_holding = last_signal.get('next_holding', '未知')
-                next_score = last_signal.get('score', 0)
-                
-                # Map code if possible
-                etf_code_map = {
-                    '日经ETF': '513520.SH',
-                    '纳指ETF': '513100.SH',
-                    '港股科技': '513020.SH', 
-                    '港股科技ETF': '513020.SH',
-                    '上证180': '510180.SH',
-                    '180ETF': '510180.SH',
-                    '科创板': '588120.SH',
-                    '科创板ETF': '588120.SH',
-                    '创业板': '159915.SZ',
-                    '创业板ETF': '159915.SZ',
-                    '南方原油': '501018.SH',
-                    '南方原油(LOF)': '501018.SH',
-                    '黄金ETF': '518880.SH',
-                    '30年国债': '511090.SH',
-                    '30年国债ETF': '511090.SH'
-                }
-                # Clean name for mapping
-                holding_code = etf_code_map.get(next_holding, '')
-                if holding_code:
-                    holding_display = f"{next_holding} ({holding_code})"
-                else:
-                    holding_display = next_holding
-                
-                # 3. Current Drawdown
-                # Calculated above as current_dd
-                
-                # 4. Other Scores
-                # We need scores for the last date in timeline
-                other_scores_display = ""
-                if latest_data_date in scores_df.index:
-                    today_scores = scores_df.loc[latest_data_date].dropna().sort_values(ascending=False)
-                    # Filter out the winner to avoid duplication if desired, or show all
-                    # Let's show top 5 others
-                    score_strs = []
-                    for asset, score in today_scores.items():
-                        if asset != next_holding:
-                            score_strs.append(f"{asset}: {score:.1f}")
+    # Check if results exist
+    if 'bt_results' in st.session_state:
+        res = st.session_state['bt_results']
+        df_res = res['df_res']
+        df_trades = res['df_trades']
+        timeline = res['timeline']
+        last_signal = res['last_signal']
+        scores_df = res['scores_df']
+        run_params = res['params'] # Use the params that were used for this run
+
+        if df_res is None or df_res.empty:
+            st.error("该时间段内无数据或回测失败。")
+        else:
+            # Calculate daily cumulative return
+            df_res['cum_return'] = df_res['value'] / run_params['initial_capital'] - 1
+
+            # --- Metrics Calculation ---
+            total_ret = df_res['value'].iloc[-1] / df_res['value'].iloc[0] - 1
+            days = (df_res.index[-1] - df_res.index[0]).days
+            if days > 0:
+                ann_ret = (1 + total_ret) ** (365 / days) - 1
+            else:
+                ann_ret = 0
+            
+            # Volatility
+            daily_ret = df_res['value'].pct_change().dropna()
+            vol = daily_ret.std() * np.sqrt(252)
+            
+            # Sharpe
+            risk_free = 0.02
+            sharpe = (ann_ret - risk_free) / vol if vol != 0 else 0
+            
+            # Max Drawdown
+            cum_max = df_res['value'].cummax()
+            drawdown = (df_res['value'] - cum_max) / cum_max
+            max_dd = drawdown.min()
+            current_dd = drawdown.iloc[-1]
+            
+            # --- Display Metrics ---
+            st.markdown("### 📊 回测绩效概览")
+            col1, col2, col3, col4, col5 = st.columns(5)
+            col1.metric("总收益率", f"{total_ret:.2%}", delta_color="normal")
+            col2.metric("年化收益率", f"{ann_ret:.2%}", delta_color="normal")
+            col3.metric("夏普比率", f"{sharpe:.2f}")
+            col4.metric("最大回撤", f"{max_dd:.2%}", delta_color="inverse")
+            col5.metric("年化波动率", f"{vol:.2%}", delta_color="inverse")
+            
+            st.divider()
+
+            # --- NEW: Asset Contribution Analysis ---
+            st.markdown("### 🧬 各标的贡献分析")
+            
+            # 1. Holding Days
+            # Group by 'holding' column in df_res
+            holding_days = df_res.groupby('holding').size()
+            
+            # 2. PnL & Max Drawdown per Asset
+            # PnL from trades
+            asset_pnl = df_trades[df_trades['action'] == '卖出'].groupby('asset')['pnl_amount'].sum()
+            
+            # Max Drawdown Calculation per Asset (Strategy MDD during holding period)
+            asset_mdd = {}
+            
+            # Identify continuous segments for each asset
+            # Create a group id that changes when holding changes
+            df_res['group'] = (df_res['holding'] != df_res['holding'].shift()).cumsum()
+            
+            for group_id, group_df in df_res.groupby('group'):
+                asset_name = group_df['holding'].iloc[0]
+                if asset_name == '现金':
+                    continue
                     
-                    if score_strs:
-                        other_scores_display = " | ".join(score_strs)
+                # Calculate MDD for this segment
+                # We look at the strategy value curve during this period
+                vals = group_df['value']
+                # To capture drawdown correctly, we need the peak from the START of this segment
+                # But actually, drawdown is usually relative to the running max OF THE SEGMENT?
+                # Or relative to the all-time high?
+                # "Strategy's Max Drawdown while holding Asset X" usually means 
+                # looking at the curve segment and finding the max drop within it.
+                # Standard MDD for a series:
+                cum_max_segment = vals.cummax()
+                dd_segment = (vals - cum_max_segment) / cum_max_segment
+                min_dd_segment = dd_segment.min()
                 
-                st.info(f"""
-                **📅 策略状态面板**  
-                **数据更新至**: {latest_data_date}  
-                **T+1 建议持仓**: **{holding_display}** (动量分: {next_score:.1f})  
-                **当前回撤**: {current_dd:.2%}
+                if asset_name not in asset_mdd:
+                    asset_mdd[asset_name] = min_dd_segment
+                else:
+                    # Take the worst drawdown across all segments for this asset
+                    asset_mdd[asset_name] = min(asset_mdd[asset_name], min_dd_segment)
+            
+            # Combine into DataFrame
+            all_assets_involved = set(holding_days.index) | set(asset_pnl.index)
+            # Remove Cash if present
+            if '现金' in all_assets_involved:
+                all_assets_involved.remove('现金')
                 
-                **其他标的得分**: {other_scores_display}
-                """)
+            contribution_data = []
+            for asset in all_assets_involved:
+                days = holding_days.get(asset, 0)
+                pnl = asset_pnl.get(asset, 0.0)
+                mdd = asset_mdd.get(asset, 0.0)
                 
-                st.divider()
+                # Contribution to Total Return
+                # Use initial capital as base
+                contrib_pct = pnl / run_params['initial_capital']
                 
-                # --- Charts ---
-                st.markdown("### 📈 收益与回撤曲线")
+                contribution_data.append({
+                    '标的': asset,
+                    '总持仓天数 (交易日)': days,
+                    '持仓占比': days / len(df_res) if len(df_res) > 0 else 0,
+                    '贡献收益率': contrib_pct,
+                    '期间最大回撤': mdd
+                })
                 
-                # Plotly Chart
-                fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
-                                    vertical_spacing=0.05, 
-                                    subplot_titles=("策略净值曲线", "回撤曲线"),
-                                    row_heights=[0.7, 0.3])
+            if contribution_data:
+                df_contrib = pd.DataFrame(contribution_data).sort_values('贡献收益率', ascending=False)
                 
-                # Equity Curve
-                fig.add_trace(go.Scatter(x=df_res.index, y=df_res['value'], 
-                                         mode='lines', name='策略净值',
-                                         line=dict(color='#00CC96', width=2)), row=1, col=1)
+                # Formatting
+                st.dataframe(
+                    df_contrib.style.format({
+                        '持仓占比': '{:.1%}',
+                        '贡献收益率': '{:.2%}',
+                        '期间最大回撤': '{:.2%}'
+                    }).background_gradient(subset=['贡献收益率'], cmap='RdYlGn'),
+                    use_container_width=True
+                )
+            else:
+                st.info("暂无持仓数据。")
+            
+            st.divider()
+            
+            # --- NEW SECTION: Current Status Info ---
+            # 1. Data Updated To
+            latest_data_date = timeline[-1].strftime('%Y-%m-%d')
+            
+            # 2. T+1 Holding
+            next_holding = last_signal.get('next_holding', '未知')
+            next_score = last_signal.get('score', 0)
+            
+            # Map code if possible
+            etf_code_map = {
+                '日经ETF': '513520.SH',
+                '纳指ETF': '513100.SH',
+                '港股科技': '513020.SH', 
+                '港股科技ETF': '513020.SH',
+                '上证180': '510180.SH',
+                '180ETF': '510180.SH',
+                '科创板': '588120.SH',
+                '科创板ETF': '588120.SH',
+                '创业板': '159915.SZ',
+                '创业板ETF': '159915.SZ',
+                '南方原油': '501018.SH',
+                '南方原油(LOF)': '501018.SH',
+                '黄金ETF': '518880.SH',
+                '30年国债': '511090.SH',
+                '30年国债ETF': '511090.SH'
+            }
+            # Clean name for mapping
+            holding_code = etf_code_map.get(next_holding, '')
+            if holding_code:
+                holding_display = f"{next_holding} ({holding_code})"
+            else:
+                holding_display = next_holding
+            
+            # 3. Current Drawdown
+            # Calculated above as current_dd
+            
+            # 4. Other Scores
+            # We need scores for the last date in timeline
+            other_scores_display = ""
+            if latest_data_date in scores_df.index:
+                today_scores = scores_df.loc[latest_data_date].dropna().sort_values(ascending=False)
+                # Filter out the winner to avoid duplication if desired, or show all
+                # Let's show top 5 others
+                score_strs = []
+                for asset, score in today_scores.items():
+                    if asset != next_holding:
+                        score_strs.append(f"{asset}: {score:.1f}")
                 
-                # Drawdown Curve
-                fig.add_trace(go.Scatter(x=df_res.index, y=drawdown, 
-                                         mode='lines', name='回撤',
-                                         fill='tozeroy',
-                                         line=dict(color='#EF553B', width=1)), row=2, col=1)
+                if score_strs:
+                    other_scores_display = " | ".join(score_strs)
+            
+            st.info(f"""
+            **📅 策略状态面板**  
+            **数据更新至**: {latest_data_date}  
+            **T+1 建议持仓**: **{holding_display}** (动量分: {next_score:.1f})  
+            **当前回撤**: {current_dd:.2%}
+            
+            **其他标的得分**: {other_scores_display}
+            """)
+            
+            st.divider()
+            
+            # --- Charts ---
+            st.markdown("### 📈 收益与回撤曲线")
+            
+            # Plotly Chart
+            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
+                                vertical_spacing=0.05, 
+                                subplot_titles=("策略净值曲线", "回撤曲线"),
+                                row_heights=[0.7, 0.3])
+            
+            # Equity Curve
+            fig.add_trace(go.Scatter(x=df_res.index, y=df_res['value'], 
+                                     mode='lines', name='策略净值',
+                                     line=dict(color='#00CC96', width=2)), row=1, col=1)
+            
+            # Drawdown Curve
+            fig.add_trace(go.Scatter(x=df_res.index, y=drawdown, 
+                                     mode='lines', name='回撤',
+                                     fill='tozeroy',
+                                     line=dict(color='#EF553B', width=1)), row=2, col=1)
+            
+            fig.update_layout(height=600, margin=dict(l=20, r=20, t=40, b=20), hovermode="x unified")
+            st.plotly_chart(fig, use_container_width=True)
+            
+            st.divider()
+
+            # --- Thermometer Chart ---
+            st.markdown("### 🌡️ 策略温度计指标")
+            
+            # Calculate
+            thermometer, plot_line = calculate_thermometer(df_res)
+            
+            fig_therm = go.Figure()
+            
+            fig_therm.add_trace(go.Scatter(
+                x=thermometer.index, 
+                y=thermometer,
+                mode='lines',
+                name='温度计 (Thermometer)',
+                line=dict(color='#FFD700', width=1),
+                fill='tozeroy',
+                fillcolor='rgba(255, 215, 0, 0.1)'
+            ))
+            
+            fig_therm.add_trace(go.Scatter(
+                x=plot_line.index,
+                y=plot_line,
+                mode='lines',
+                name='平滑线 (Signal)',
+                line=dict(color='#FF4500', width=2)
+            ))
+            
+            # Add horizontal lines
+            fig_therm.add_hline(y=20, line_dash="dash", line_color="green", annotation_text="超卖 (20)")
+            fig_therm.add_hline(y=80, line_dash="dash", line_color="red", annotation_text="超买 (80)")
+            
+            fig_therm.update_layout(
+                height=300, 
+                margin=dict(l=20, r=20, t=20, b=20),
+                yaxis=dict(range=[0, 100], title="温度"),
+                hovermode="x unified"
+            )
+            
+            st.plotly_chart(fig_therm, use_container_width=True)
+            
+            st.divider()
+
+            # --- NEW: Periodic Return Analysis ---
+            st.markdown("### 🗓️ 周期收益分析")
+            
+            # 1. Prepare Data
+            # df_res has 'value' and 'cum_return'
+            # We need to calculate periodic returns
+            
+            # Resample
+            df_daily = df_res[['value']].copy()
+            df_daily['return'] = df_daily['value'].pct_change()
+            
+            # Monthly
+            monthly_ret = df_daily['value'].resample('M').last().pct_change()
+            monthly_ret.iloc[0] = df_daily['value'].iloc[0] / run_params['initial_capital'] - 1 
+            # Better: Monthly return = End / Start - 1
+            monthly_groups = df_daily.groupby(pd.Grouper(freq='M'))
+            monthly_data = []
+            for date, group in monthly_groups:
+                if not group.empty:
+                    start_val = group['value'].iloc[0]
+                    # If it's the very first month, start from initial capital? 
+                    # Actually, previous month end.
+                    # Let's use simple pct_change on resampled end-of-month values
+                    pass
+            
+            # Standard way: Resample last price, then pct_change
+            # But we need to handle the very first period correctly relative to initial capital or previous close.
+            
+            # Let's construct a daily series including start date-1 with initial capital if needed?
+            # Or just use the daily returns and compound them.
+            
+            # Heatmap Data Construction
+            # Year on Y-axis, Month on X-axis
+            
+            df_daily['year'] = df_daily.index.year
+            df_daily['month'] = df_daily.index.month
+            df_daily['quarter'] = df_daily.index.quarter
+            
+            # Calculate monthly returns by compounding daily returns
+            monthly_rets = df_daily.groupby(['year', 'month'])['return'].apply(lambda x: (1 + x).prod() - 1)
+            monthly_rets_df = monthly_rets.unstack(level='month') * 100 # In percent
+            
+            # Yearly returns
+            yearly_rets = df_daily.groupby(['year'])['return'].apply(lambda x: (1 + x).prod() - 1) * 100
+            
+            # Quarterly returns
+            quarterly_rets = df_daily.groupby(['year', 'quarter'])['return'].apply(lambda x: (1 + x).prod() - 1) * 100
+            
+            # UI Control
+            period_view = st.radio("显示模式", ["月度热力图", "年度收益柱状图", "季度收益柱状图"], horizontal=True)
+            
+            if period_view == "月度热力图":
+                # Heatmap
+                # x: Month, y: Year, z: Return
                 
-                fig.update_layout(height=600, margin=dict(l=20, r=20, t=40, b=20), hovermode="x unified")
-                st.plotly_chart(fig, use_container_width=True)
+                # Fill missing months with 0 or NaN
+                # Reindex columns 1-12
+                for m in range(1, 13):
+                    if m not in monthly_rets_df.columns:
+                        monthly_rets_df[m] = np.nan
+                monthly_rets_df = monthly_rets_df[sorted(monthly_rets_df.columns)]
                 
-                # --- Trade Log & Holdings ---
-                st.markdown("### 📝 交易记录与持仓明细")
+                # Add Year Total column?
+                monthly_rets_df['Year Total'] = yearly_rets
                 
-                tab1, tab2 = st.tabs(["调仓记录", "每日持仓"])
+                # Plotly Heatmap
+                # We transpose for Y=Year, X=Month
+                # But heatmap expects z as 2D array
                 
-                with tab1:
-                    if df_trades is not None and not df_trades.empty:
-                        # Sort descending
-                        df_trades_sorted = df_trades.sort_values('date', ascending=False)
-                        st.dataframe(df_trades_sorted.style.format({
-                            'price': '{:.3f}', 
-                            'shares': '{:.0f}', 
-                            'amount': '{:.2f}',
-                            'fee': '{:.2f}',
-                            'return_pct': '{:.2%}',
-                            'trade_return': '{:.2%}'
-                        }, na_rep="-"), use_container_width=True)
-                    else:
-                        st.info("该期间无交易记录。")
-                        
-                with tab2:
+                # Better to use text for values
+                z_vals = monthly_rets_df.values
+                x_labels = [f"{m}月" for m in range(1, 13)] + ['年度合计']
+                y_labels = monthly_rets_df.index.astype(str)
+                
+                # Custom Color Scale: Green (Negative) -> White (Zero) -> Red (Positive)
+                # Using specific colors for better visibility
+                custom_colorscale = [
+                    [0.0, '#008000'],   # Green for Loss
+                    [0.5, '#ffffff'],   # White for Zero
+                    [1.0, '#ff0000']    # Red for Profit
+                ]
+                
+                # Determine symmetric range for color balance
+                # Filter nans for calculation
+                valid_vals = z_vals[~np.isnan(z_vals)]
+                if len(valid_vals) > 0:
+                    max_abs = np.max(np.abs(valid_vals))
+                    # Ensure a minimum range to avoid solid colors for small returns
+                    if max_abs < 1: max_abs = 1
+                else:
+                    max_abs = 10
+                
+                # Create annotations
+                annotations = []
+                for i, row in enumerate(z_vals):
+                    for j, val in enumerate(row):
+                        if pd.notnull(val):
+                            # Contrast text color
+                            # If background is dark (high absolute value), use white text
+                            text_color = "white" if abs(val) > (max_abs * 0.5) else "black"
+                            
+                            annotations.append(dict(
+                                x=x_labels[j], y=y_labels[i],
+                                text=f"{val:.1f}%",
+                                xref="x", yref="y",
+                                showarrow=False,
+                                font=dict(color=text_color, size=14)
+                            ))
+                
+                fig_heat = go.Figure(data=go.Heatmap(
+                    z=z_vals,
+                    x=x_labels,
+                    y=y_labels,
+                    colorscale=custom_colorscale,
+                    zmid=0,
+                    zmin=-max_abs,
+                    zmax=max_abs,
+                    hoverongaps=False,
+                    xgap=1, # Add gap between cells
+                    ygap=1
+                ))
+                
+                fig_heat.update_layout(
+                    title="月度收益率热力图 (%)",
+                    height=400 + len(y_labels) * 40, # Increase height per row
+                    annotations=annotations,
+                    xaxis_side="top",
+                    margin=dict(l=0, r=0, t=50, b=0) # Adjust margins
+                )
+                st.plotly_chart(fig_heat, use_container_width=True)
+                
+            elif period_view == "年度收益柱状图":
+                fig_bar = go.Figure()
+                fig_bar.add_trace(go.Bar(
+                    x=yearly_rets.index,
+                    y=yearly_rets.values,
+                    marker_color=['#EF553B' if x > 0 else '#00CC96' for x in yearly_rets.values],
+                    text=[f"{x:.1f}%" for x in yearly_rets.values],
+                    textposition='auto'
+                ))
+                fig_bar.update_layout(
+                    title="年度收益率 (%)",
+                    xaxis_title="年份",
+                    yaxis_title="收益率 (%)",
+                    showlegend=False
+                )
+                st.plotly_chart(fig_bar, use_container_width=True)
+                
+            elif period_view == "季度收益柱状图":
+                # Format index for display: "2023-Q1"
+                q_labels = [f"{y}-Q{q}" for y, q in quarterly_rets.index]
+                
+                fig_q = go.Figure()
+                fig_q.add_trace(go.Bar(
+                    x=q_labels,
+                    y=quarterly_rets.values,
+                    marker_color=['#EF553B' if x > 0 else '#00CC96' for x in quarterly_rets.values],
+                    text=[f"{x:.1f}%" for x in quarterly_rets.values],
+                    textposition='auto'
+                ))
+                fig_q.update_layout(
+                    title="季度收益率 (%)",
+                    xaxis_title="季度",
+                    yaxis_title="收益率 (%)",
+                    showlegend=False
+                )
+                st.plotly_chart(fig_q, use_container_width=True)
+
+            # --- Trade Log & Holdings ---
+            st.markdown("### 📝 交易记录与持仓明细")
+            
+            tab1, tab2 = st.tabs(["调仓记录", "每日持仓"])
+            
+            with tab1:
+                if df_trades is not None and not df_trades.empty:
                     # Sort descending
-                    df_res_sorted = df_res.sort_index(ascending=False)
-                    st.dataframe(df_res_sorted.style.format({
-                        'value': '{:.2f}',
-                        'cum_return': '{:.2%}'
-                    }), use_container_width=True)
+                    df_trades_sorted = df_trades.sort_values('date', ascending=False)
+                    st.dataframe(df_trades_sorted.style.format({
+                        'price': '{:.3f}', 
+                        'shares': '{:.0f}', 
+                        'amount': '{:.2f}',
+                        'fee': '{:.2f}',
+                        'return_pct': '{:.2%}',
+                        'trade_return': '{:.2%}',
+                        'pnl_amount': '{:,.2f}'
+                    }, na_rep="-"), use_container_width=True)
+                else:
+                    st.info("该期间无交易记录。")
                     
+            with tab2:
+                # Sort descending
+                df_res_sorted = df_res.sort_index(ascending=False)
+                st.dataframe(df_res_sorted.style.format({
+                    'value': '{:.2f}',
+                    'cum_return': '{:.2%}'
+                }), use_container_width=True)
+            
+            st.divider()
+
+            # --- NEW: Asset Trade Visualization ---
+            st.markdown("### 📈 标的交易详情可视化")
+            st.info("点击下方展开查看各标的的收盘价曲线及买卖点标记。鼠标悬停在卖出点（绿色倒三角）可查看该笔交易的收益率。")
+
+            # Get list of assets traded
+            traded_assets = df_trades['asset'].unique() if df_trades is not None else []
+            
+            if len(traded_assets) > 0:
+                for asset in traded_assets:
+                    with st.expander(f"查看 {asset} 交易记录"):
+                        # Get OHLC
+                        if asset in history_data:
+                            asset_ohlc = history_data[asset]
+                            asset_trades = df_trades[df_trades['asset'] == asset]
+                            
+                            # Plot
+                            fig_asset = plot_asset_trades(
+                                asset, 
+                                asset_ohlc, 
+                                asset_trades, 
+                                df_res.index[0], # Start Date of backtest
+                                df_res.index[-1] # End Date of backtest
+                            )
+                            
+                            if fig_asset:
+                                st.plotly_chart(fig_asset, use_container_width=True)
+                            else:
+                                st.warning(f"无法获取 {asset} 的价格数据")
+            else:
+                st.write("无交易标的。")
+                
     else:
         st.info("👈 请在左侧调整参数并点击“开始回测”")
 

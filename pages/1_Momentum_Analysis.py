@@ -3,8 +3,9 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import os
-from scipy.stats import linregress
+import sys
 
 # Set page configuration
 st.set_page_config(
@@ -13,11 +14,11 @@ st.set_page_config(
     layout="wide"
 )
 
-st.title("🔥 动量得分与“过热熔断”机制深度分析")
+st.title("🔥 动量得分深度分析仪表盘")
 
 # ----------------- Data Loading & Calculation -----------------
 
-@st.cache_data
+# Remove cache to ensure we always load the latest data after updates in Home.py
 def load_data():
     """Load history data for all assets"""
     mapping = {
@@ -35,204 +36,394 @@ def load_data():
     data = {}
     for name, filename in mapping.items():
         if os.path.exists(filename):
-            df = pd.read_csv(filename)
-            df['trade_date'] = pd.to_datetime(df['trade_date'], format='%Y%m%d')
-            df = df.sort_values('trade_date').set_index('trade_date')
-            data[name] = df
+            try:
+                df = pd.read_csv(filename)
+                if 'trade_date' in df.columns:
+                    try:
+                        df['trade_date'] = pd.to_datetime(df['trade_date'], format='%Y%m%d')
+                    except:
+                        df['trade_date'] = pd.to_datetime(df['trade_date'])
+                df = df.sort_values('trade_date').set_index('trade_date')
+                data[name] = df
+            except Exception as e:
+                st.error(f"Error loading {filename}: {e}")
     return data
 
 @st.cache_data
-def calculate_scores_and_returns(data):
+def calculate_scores_for_analysis(data, window):
     """
-    Calculate Momentum Score (WLS) and Next-20-Day Return for each day.
-    To analyze predictive power of Score on Future Return.
+    Calculate Momentum Score (WLS) and Future Returns.
     """
     results = []
     
-    # Analyze all dates
-    all_dates = sorted(list(set().union(*[df.index for df in data.values()])))
-    # Filter from 2017
-    all_dates = [d for d in all_dates if d >= pd.Timestamp('2017-08-01')]
-    
-    # Sample every 5 days to speed up? Or all days.
-    # Let's use all days but only for valid windows.
-    
     for asset_name, df in data.items():
-        # Calculate Score for each day
-        # Rolling window calculation
-        
-        # We need:
-        # 1. Score at day T (using T-19 to T)
-        # 2. Return from T+1 to T+21 (Next 20 days holding return)
-        
-        # Pre-calculate log prices
-        df['log_price'] = np.log(df['close'])
-        
-        # We can loop or use rolling apply (complex with WLS)
-        # Loop is easier to understand
-        
-        prices = df['close'].values
+        # Prefer adjusted close for score calculation to handle splits
+        if 'adj_close' in df.columns:
+            prices = df['adj_close'].values
+            price_col = 'adj_close'
+        elif 'close' in df.columns:
+            prices = df['close'].values
+            price_col = 'close'
+        else:
+            continue
+            
         dates = df.index
         
-        for i in range(19, len(df) - 20): # Ensure we have 20 days future
-            # Window T-19 to T
-            window_prices = prices[i-19 : i+1]
-            current_date = dates[i]
+        # Vectorized-ish loop
+        # We need to iterate
+        x = np.arange(window)
+        weights = 1 + (np.linspace(0, 1, window) ** 2)
+        
+        for i in range(window, len(df) - 20): # Ensure 20d future
+            window_prices = prices[i-window : i]
+            if len(window_prices) < window: continue
             
-            # Calc Score
-            y = np.log(window_prices)
-            x = np.arange(20)
-            weights = 1 + (np.linspace(0, 1, 20) ** 2)
+            # Skip if NaN
+            if np.isnan(window_prices).any(): continue
             
-            coeffs = np.polyfit(x, y, 1, w=weights)
-            slope = coeffs[0]
-            
-            y_pred = np.polyval(coeffs, x)
-            sse = np.sum(weights * (y - y_pred)**2)
-            sst = np.sum(weights * (y - np.average(y, weights=weights))**2)
-            r2 = 1 - sse/sst if sst != 0 else 0
-            
-            score = (np.exp(slope * 252) - 1) * r2 * 100
-            
-            # Calc Future Return (Next 20 days)
-            # Price at T+1 (Buy) to T+21 (Sell)? Or T to T+20?
-            # Strategy trades at T+1 Open.
-            # Let's approximate: Return from T Close to T+20 Close.
-            future_ret = prices[i+20] / prices[i] - 1
-            
-            # Future Max Drawdown (Risk)
-            future_window = prices[i+1 : i+21]
-            cum_max = np.maximum.accumulate(future_window)
-            dd = (future_window - cum_max) / cum_max
-            future_max_dd = dd.min()
-            
-            results.append({
-                'Asset': asset_name,
-                'Date': current_date,
-                'Score': score,
-                'Future_Return_20d': future_ret,
-                'Future_MaxDD_20d': future_max_dd
-            })
+            try:
+                current_date = dates[i-1] 
+                window_data = window_prices
+                current_price = window_data[-1]
+                
+                y = np.log(window_data)
+                
+                coeffs = np.polyfit(x, y, 1, w=weights)
+                slope = coeffs[0]
+                
+                y_pred = np.polyval(coeffs, x)
+                sse = np.sum(weights * (y - y_pred)**2)
+                sst = np.sum(weights * (y - np.average(y, weights=weights))**2)
+                r2 = 1 - sse/sst if sst != 0 else 0
+                
+                score = (np.exp(slope * 252) - 1) * r2 * 100
+                
+                # Future Return: Next 5, 10, 15, 20 days
+                res = {
+                    'Asset': asset_name,
+                    'Date': dates[i-1],
+                    'Score': score,
+                    'Close': current_price,
+                }
+                
+                for days in [5, 10, 15, 20]:
+                    future_idx = i - 1 + days
+                    if future_idx < len(prices):
+                        future_ret = prices[future_idx] / prices[i-1] - 1
+                        res[f'Future_Return_{days}d'] = future_ret
+                    else:
+                        res[f'Future_Return_{days}d'] = np.nan
+                        
+                results.append(res)
+            except:
+                pass
             
     return pd.DataFrame(results)
 
+# ----------------- UI Controls -----------------
+
 data = load_data()
-df_analysis = calculate_scores_and_returns(data)
 
-# ----------------- Analysis Section 1: Score Distribution -----------------
-
-st.header("1. 动量得分分布特征")
-st.markdown("""
-首先，我们观察一下所有标的在历史上的动量得分分布。
-大多数时候得分集中在什么区间？极端高分（>300）出现的频率是多少？
-""")
-
-col1, col2 = st.columns([2, 1])
-
-with col1:
-    fig_hist = px.histogram(
-        df_analysis, 
-        x="Score", 
-        nbins=100, 
-        color="Asset",
-        title="各标的动量得分分布直方图",
-        labels={"Score": "动量得分 (Slope * R² * 100)"}
-    )
-    fig_hist.add_vline(x=300, line_dash="dash", line_color="red", annotation_text="熔断阈值 (300)")
-    st.plotly_chart(fig_hist, use_container_width=True)
-
-with col2:
-    st.subheader("统计数据")
-    total_samples = len(df_analysis)
-    overheated_samples = len(df_analysis[df_analysis['Score'] > 300])
+with st.sidebar:
+    st.header("⚙️ 分析参数")
     
-    st.metric("总样本数", total_samples)
-    st.metric("过热样本数 (>300)", overheated_samples)
-    st.metric("过热占比", f"{overheated_samples / total_samples:.2%}")
+    if st.button("🔄 刷新数据 (清除缓存)"):
+        st.cache_data.clear()
+        st.rerun()
+
+    window_choice = st.radio("动量窗口 (天)", [20, 25], index=1, help="对比不同窗口期对得分分布的影响")
     
-    st.write("虽然过热样本占比极低，但它们往往对应着极端的行情。")
+    st.divider()
+    selected_assets = st.multiselect("选择分析标的", list(data.keys()), default=list(data.keys()))
 
-# ----------------- Analysis Section 2: Why Cutoff Works? -----------------
+if not data:
+    st.error("No data loaded.")
+    st.stop()
 
-st.header("2. 为什么“熔断”能提高收益？")
-st.markdown("""
-核心问题：**得分越高，未来的收益真的越好吗？**
-让我们看看“当前得分”与“未来20天收益”的关系。
-""")
+# Calculate
+with st.spinner(f"正在计算 {window_choice} 天窗口的动量得分..."):
+    df_all = calculate_scores_for_analysis(data, window_choice)
 
-# Bin the scores
-bins = [-float('inf'), 0, 100, 200, 300, 400, 500, float('inf')]
-labels = ['<0 (下跌)', '0-100 (温和)', '100-200 (强势)', '200-300 (极强)', '300-400 (过热)', '400-500 (疯狂)', '>500 (泡沫)']
-df_analysis['Score_Bin'] = pd.cut(df_analysis['Score'], bins=bins, labels=labels)
+if df_all.empty:
+    st.warning("无足够数据进行分析。")
+    st.stop()
 
-# Group by Bin
-bin_stats = df_analysis.groupby('Score_Bin')[['Future_Return_20d', 'Future_MaxDD_20d']].mean().reset_index()
+# Filter assets
+df_analysis = df_all[df_all['Asset'].isin(selected_assets)]
 
-col3, col4 = st.columns(2)
+# ----------------- Tab 1: Overall Statistics -----------------
 
-with col3:
-    fig_bar_ret = px.bar(
-        bin_stats,
-        x='Score_Bin',
-        y='Future_Return_20d',
-        title="不同得分区间的平均未来收益 (20天)",
-        color='Future_Return_20d',
-        color_continuous_scale='RdYlGn',
-        text_auto='.2%'
+tab1, tab2, tab3 = st.tabs(["📊 整体统计分析", "📈 标的时间序列", "🔬 收益-得分关系"])
+
+with tab1:
+    st.subheader(f"窗口期: {window_choice} 天 - 得分分布统计")
+    
+    col1, col2 = st.columns([3, 1])
+    
+    with col1:
+        # Statistical Table instead of Box Plot
+        st.markdown("**各标的得分分布统计表**")
+        
+        # Calculate stats per asset
+        stats_df = df_analysis.groupby('Asset')['Score'].describe(percentiles=[0.25, 0.5, 0.75, 0.9, 0.95, 0.99])
+        stats_df = stats_df[['count', 'mean', 'std', '50%', '75%', '90%', '99%', 'max']]
+        stats_df.columns = ['样本数', '均值', '标准差', '中位数', '75%分位', '90%分位', '99%分位', '最大值']
+        
+        # Style the dataframe
+        st.dataframe(stats_df.style.format("{:.1f}"), use_container_width=True)
+        
+    with col2:
+        # Stats Table (Overall)
+        st.markdown("**整体极值频率**")
+        total = len(df_analysis)
+        gt_300 = len(df_analysis[df_analysis['Score'] > 300])
+        gt_500 = len(df_analysis[df_analysis['Score'] > 500])
+        gt_700 = len(df_analysis[df_analysis['Score'] > 700])
+        gt_1000 = len(df_analysis[df_analysis['Score'] > 1000])
+        
+        st.metric("总样本数", total)
+        st.metric("> 300分", f"{gt_300/total:.1%}", f"{gt_300}次")
+        st.metric("> 500分", f"{gt_500/total:.1%}", f"{gt_500}次")
+        st.metric("> 700分", f"{gt_700/total:.1%}", f"{gt_700}次")
+        st.caption(f"其中 >1000分 的极端情况有 {gt_1000} 次 ({gt_1000/total:.2%})")
+        
+    # Heatmap instead of Histogram
+    st.markdown("### 动量得分区间分布热力图 (Frequency Heatmap)")
+    st.caption("颜色越深代表该标的落在该得分区间的频率越高。这能帮您识别不同标的的“性格”（如：纳指是否比国债更容易得高分？）")
+    
+    # Create bins for heatmap
+    bins = list(range(0, 1100, 100)) + [float('inf')]
+    labels = [f"{i}-{i+100}" for i in range(0, 1000, 100)] + [">1000"]
+    
+    df_heatmap = df_analysis.copy()
+    df_heatmap['Score_Range'] = pd.cut(df_heatmap['Score'], bins=bins, labels=labels, right=False)
+    
+    # Pivot table: Index=Score_Range, Columns=Asset, Values=Count
+    # Normalize by column (percentage of time for that asset)
+    heatmap_data = pd.crosstab(df_heatmap['Score_Range'], df_heatmap['Asset'], normalize='columns') * 100
+    
+    # Plot Heatmap
+    fig_hm = px.imshow(
+        heatmap_data,
+        labels=dict(x="标的资产", y="得分区间", color="频率(%)"),
+        x=heatmap_data.columns,
+        y=heatmap_data.index,
+        color_continuous_scale="Viridis",
+        text_auto=".1f",
+        aspect="auto"
     )
-    st.plotly_chart(fig_bar_ret, use_container_width=True)
-    st.info("注意看：得分在 200-300 区间时，未来收益达到顶峰。而一旦超过 300，未来收益开始**断崖式下跌**！")
+    fig_hm.update_layout(height=500)
+    st.plotly_chart(fig_hm, use_container_width=True)
 
-with col4:
-    fig_bar_dd = px.bar(
-        bin_stats,
-        x='Score_Bin',
-        y='Future_MaxDD_20d',
-        title="不同得分区间的平均未来回撤 (20天)",
-        color='Future_MaxDD_20d',
-        color_continuous_scale='Reds_r', # Darker red for worse dd
-        text_auto='.2%'
+# ----------------- Tab 2: Time Series Analysis -----------------
+
+with tab2:
+    st.subheader("价格 vs 动量得分双轴图")
+    
+    target_asset = st.selectbox("选择单一标的查看详情", selected_assets)
+    
+    if target_asset:
+        df_single = df_analysis[df_analysis['Asset'] == target_asset].sort_values('Date')
+        
+        # Create dual-axis chart
+        fig_ts = make_subplots(specs=[[{"secondary_y": True}]])
+        
+        # Since we prefer adj_close in calculation, the 'Close' column in df_single IS the adjusted close if available.
+        # Let's label it clearly.
+        price_label = "收盘价 (后复权)"
+        
+        # Price Line (Left Axis)
+        fig_ts.add_trace(
+            go.Scatter(x=df_single['Date'], y=df_single['Close'], name=price_label, 
+                       line=dict(color='#1f77b4', width=2)),
+            secondary_y=False
+        )
+        
+        # Score Line (Right Axis)
+        fig_ts.add_trace(
+            go.Scatter(x=df_single['Date'], y=df_single['Score'], name="动量得分 (右轴)", 
+                       line=dict(color='#d62728', width=1.5), opacity=0.7, fill='tozeroy'),
+            secondary_y=True
+        )
+        
+        # Add Threshold Lines
+        fig_ts.add_hline(y=300, line_dash="dash", line_color="orange", secondary_y=True, annotation_text="300")
+        fig_ts.add_hline(y=700, line_dash="dash", line_color="red", secondary_y=True, annotation_text="700")
+        
+        fig_ts.update_layout(
+            title=f"{target_asset}: 价格与动量得分走势对比",
+            hovermode="x unified",
+            height=600,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        )
+        
+        # Toggle for fixed range
+        use_fixed_range = st.checkbox("锁定右轴范围 (0-1000)", value=False, help="勾选后，右轴将固定显示 0-1000，方便对比绝对热度；取消勾选则自动缩放，方便查看得分为低值时的波动细节。")
+        
+        # Optimize Y-Axes
+        # Left Axis (Price) - Force auto range based on data
+        min_price = df_single['Close'].min()
+        max_price = df_single['Close'].max()
+        padding = (max_price - min_price) * 0.1
+        
+        fig_ts.update_yaxes(
+            title_text="<b>收盘价</b>", 
+            title_font=dict(color="#1f77b4"),
+            tickfont=dict(color="#1f77b4"),
+            secondary_y=False,
+            showgrid=False,
+            range=[min_price - padding, max_price + padding] # Explicitly set range
+        )
+        
+        # Right Axis (Score)
+        y2_config = dict(
+            title_text="<b>动量得分</b>", 
+            title_font=dict(color="#d62728"),
+            tickfont=dict(color="#d62728"),
+            secondary_y=True,
+            showgrid=True,
+        )
+        
+        if use_fixed_range:
+            y2_config['range'] = [0, max(1000, df_single['Score'].max() * 1.1)]
+            y2_config['rangemode'] = "tozero"
+        else:
+            # Auto range for score too
+            min_score = df_single['Score'].min()
+            max_score = df_single['Score'].max()
+            # If min_score is close to 0, use 0. If negative (unlikely for this logic), follow data.
+            # But usually score >= 0.
+            # Let's give it some padding too.
+            score_padding = (max_score - min_score) * 0.1 if max_score > min_score else 10
+            y2_config['range'] = [max(0, min_score - score_padding), max_score + score_padding]
+            
+        fig_ts.update_yaxes(**y2_config)
+        
+        st.plotly_chart(fig_ts, use_container_width=True)
+        
+        st.info("""
+        **观察要点**:
+        1. **见顶信号**: 观察得分是否在价格见顶前率先飙升到 >300 或 >700 的极端区域？
+        2. **背离**: 价格还在涨，但得分开始下降（量价背离），往往是趋势强弩之末的信号。
+        """)
+
+# ----------------- Tab 3: Return Analysis (The Inverted U) -----------------
+
+with tab3:
+    st.subheader("🔬 动量分段收益统计 (0-2000分)")
+    
+    st.markdown("统计每一个标的在动量分数达到某一个数值区间后，未来 5/10/15/20 天的平均收益回报。")
+    
+    # 1. Configuration
+    col_conf1, col_conf2 = st.columns(2)
+    with col_conf1:
+        target_asset_stats = st.selectbox("选择分析标的", selected_assets, key="stats_asset")
+    
+    # 2. Binning
+    # Create bins 0 to 2000 with step 50
+    bins = list(range(0, 2050, 50))
+    # Labels: 0, 50, 100... (Use left edge or center for plot?) Let's use left edge string for category
+    # But for plotting line chart, using numeric center is better.
+    
+    df_asset = df_analysis[df_analysis['Asset'] == target_asset_stats].copy()
+    
+    # Cut
+    df_asset['Score_Bin'] = pd.cut(df_asset['Score'], bins=bins, labels=bins[:-1])
+    
+    # Groupby
+    # We want mean return for each period
+    cols = ['Future_Return_5d', 'Future_Return_10d', 'Future_Return_15d', 'Future_Return_20d']
+    stats = df_asset.groupby('Score_Bin')[cols].mean()
+    
+    # Count samples to avoid noise
+    counts = df_asset.groupby('Score_Bin')['Score'].count()
+    stats['Sample_Count'] = counts
+    
+    # Filter out empty bins or bins with very few samples? 
+    # User didn't ask, but it's good practice. For now show all non-empty.
+    stats = stats.dropna(how='all')
+    
+    # Convert index to numeric for plotting
+    stats.index = stats.index.astype(int)
+    
+    # 3. Visualization
+    st.markdown(f"### {target_asset_stats}：不同动量分数的未来收益率曲线")
+    
+    fig = go.Figure()
+    
+    colors = ['#FF9F33', '#33C1FF', '#33FF57', '#FF3333'] # 5, 10, 15, 20
+    
+    for i, col in enumerate(cols):
+        days = col.split('_')[2]
+        fig.add_trace(go.Scatter(
+            x=stats.index, 
+            y=stats[col],
+            mode='lines+markers',
+            name=f'{days} 收益率',
+            line=dict(width=2, color=colors[i]),
+            connectgaps=True # Connect if some intermediate bins are empty? Maybe no.
+        ))
+    
+    # Add Zero Line
+    fig.add_hline(y=0, line_dash="solid", line_color="gray", opacity=0.5)
+    
+    # Add Sample Count Bar on secondary axis? Or just hover.
+    # Let's add bars for sample count at the bottom or secondary axis
+    fig.add_trace(go.Bar(
+        x=stats.index,
+        y=stats['Sample_Count'],
+        name='样本数量',
+        marker_color='lightgray',
+        opacity=0.3,
+        yaxis='y2'
+    ))
+    
+    fig.update_layout(
+        title="动量得分 vs 未来收益率 (及样本分布)",
+        xaxis_title="动量得分 (Score)",
+        yaxis_title="平均收益率",
+        yaxis=dict(tickformat='.2%'),
+        yaxis2=dict(
+            title="样本数量",
+            overlaying='y',
+            side='right',
+            showgrid=False
+        ),
+        hovermode="x unified",
+        legend=dict(orientation="h", y=1.1),
+        height=600
     )
-    st.plotly_chart(fig_bar_dd, use_container_width=True)
-    st.info("风险视角：得分超过 300 后，未来的平均回撤显著增大。这意味着“过热”后往往紧接着剧烈的均值回归。")
-
-# ----------------- Analysis Section 3: Scatter Plot -----------------
-
-st.header("3. 均值回归的微观证据")
-st.markdown("让我们在散点图上更直观地看到这种“倒U型”关系。")
-
-fig_scatter = px.scatter(
-    df_analysis,
-    x="Score",
-    y="Future_Return_20d",
-    color="Asset",
-    trendline="lowess", # Locally Weighted Scatterplot Smoothing
-    trendline_color_override="black",
-    title="动量得分 vs 未来20日收益 (散点图 + 趋势线)",
-    opacity=0.5,
-    hover_data=['Date']
-)
-fig_scatter.add_vline(x=300, line_dash="dash", line_color="red", annotation_text="收益反转点")
-st.plotly_chart(fig_scatter, use_container_width=True)
-
-# ----------------- Analysis Section 4: Case Study -----------------
-
-st.header("4. 典型案例：那些被“熔断”救下的时刻")
-st.markdown("筛选出得分 > 300 且随后大跌的典型案例。")
-
-overheated_crashes = df_analysis[
-    (df_analysis['Score'] > 300) & 
-    (df_analysis['Future_Return_20d'] < -0.1)
-].sort_values('Score', ascending=False).head(10)
-
-st.table(overheated_crashes[['Date', 'Asset', 'Score', 'Future_Return_20d', 'Future_MaxDD_20d']].style.format({
-    'Score': '{:.2f}',
-    'Future_Return_20d': '{:.2%}',
-    'Future_MaxDD_20d': '{:.2%}'
-}))
-
-st.markdown("""
-### 总结
-1.  **收益非线性**：动量策略并非“强者恒强”那么简单。在一定范围内（0-300），得分越高收益越好；但超过临界点（300）后，**动量效应失效，反转效应占主导**。
-2.  **熔断机制的价值**：设置 Score < 300 的熔断机制，本质上是在**“动量因子”**失效的区间，自动切换到了**“反转因子”**（通过卖出避免下跌），从而完美地规避了泡沫破裂的风险。
-""")
+    
+    st.plotly_chart(fig, use_container_width=True)
+    
+    # 4. Data Table
+    with st.expander("查看详细统计数据"):
+        # Format for display
+        display_stats = stats.copy()
+        for c in cols:
+            display_stats[c] = display_stats[c].apply(lambda x: f"{x:.2%}" if pd.notnull(x) else "-")
+        st.dataframe(display_stats)
+        
+    st.divider()
+    
+    # 5. Global Heatmap (All Assets, One Period)
+    st.markdown("### 全市场对比：动量得分 vs 20日收益率")
+    st.caption("横轴为动量得分区间，纵轴为不同标的。颜色代表**未来20天的平均收益率**。")
+    
+    # Global aggregation
+    df_analysis['Score_Bin_Global'] = pd.cut(df_analysis['Score'], bins=bins, labels=bins[:-1])
+    global_stats = df_analysis.groupby(['Asset', 'Score_Bin_Global'])['Future_Return_20d'].mean().unstack()
+    
+    # Filter columns (bins) that are mostly empty to keep chart clean?
+    # Keep 0-1000 range mostly
+    valid_cols = [c for c in global_stats.columns if c < 1200]
+    global_stats_clean = global_stats[valid_cols]
+    
+    fig_hm_ret = px.imshow(
+        global_stats_clean,
+        labels=dict(x="动量得分区间", y="标的", color="20日收益率"),
+        color_continuous_scale="RdYlGn",
+        color_continuous_midpoint=0,
+        aspect="auto"
+    )
+    st.plotly_chart(fig_hm_ret, use_container_width=True)
