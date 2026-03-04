@@ -1246,7 +1246,7 @@ def render_backtest_page():
                         '持仓占比': '{:.1%}',
                         '贡献收益率': '{:.2%}',
                         '期间最大回撤': '{:.2%}'
-                    }).background_gradient(subset=['贡献收益率'], cmap='RdYlGn'),
+                    }),
                     use_container_width=True
                 )
             else:
