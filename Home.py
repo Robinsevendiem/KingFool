@@ -571,11 +571,23 @@ def run_backtest(history_data, raw_scores_df, params):
                         next_target = '现金'
                     else:
                         # 3. Normalize Valid Scores (Relative to Pool)
-                        vals = pool_scores.values
+                        # Check normalization mode
+                        exclude_overheated = params.get('exclude_overheated_from_norm', False)
+                        
+                        if exclude_overheated:
+                            # Use only valid candidates (which are already filtered by cutoff) for normalization range
+                            norm_basis = valid_candidates
+                        else:
+                            # Use entire pool (including overheated)
+                            norm_basis = pool_scores
+                            
+                        vals = norm_basis.values
                         mn, mx = np.min(vals), np.max(vals)
+                        
                         if mx == mn:
                             norm_scores = pd.Series(50, index=pool_scores.index)
                         else:
+                            # Normalize all scores based on the chosen range
                             norm_scores = (pool_scores - mn) / (mx - mn) * 100
                             
                         # Best Valid Asset
@@ -846,7 +858,7 @@ def get_strategy_params():
     }
 
     if cutoff_mode == "全局统一设置":
-        global_cutoff = st.sidebar.number_input("全局熔断阈值", min_value=50, max_value=2000, value=700, step=50)
+        global_cutoff = st.sidebar.number_input("全局熔断阈值", min_value=50, max_value=2000, value=600, step=50)
         for code in code_to_name.keys():
             user_cutoffs[code] = global_cutoff
     else:
@@ -869,7 +881,13 @@ def get_strategy_params():
                 val = st.number_input(f"{name} ({code})", min_value=50, max_value=2000, value=default_val, step=50)
                 user_cutoffs[code] = val
             
-    buffer_score = st.sidebar.number_input("换仓缓冲阈值 (分差)", min_value=0.0, max_value=50.0, value=8.0, step=0.5)
+    buffer_score = st.sidebar.number_input("换仓缓冲阈值 (分差)", min_value=0.0, max_value=50.0, value=5.0, step=0.5)
+    
+    exclude_overheated_from_norm = st.sidebar.checkbox(
+        "归一化时剔除过热标的", 
+        value=True,
+        help="勾选后，在计算归一化分数时，将先剔除超过熔断阈值的标的，再以剩余标的的最高分作为100分基准。这会放大剩余标的之间的分差，可能增加换仓频率。"
+    )
     
     # Crash Filter Params
     st.sidebar.subheader("风控参数")
@@ -892,6 +910,7 @@ def get_strategy_params():
         'window': window,
         'user_cutoffs': user_cutoffs,
         'buffer_score': buffer_score,
+        'exclude_overheated_from_norm': exclude_overheated_from_norm,
         'fee_rate': fee_rate,
         'initial_capital': initial_capital,
         'crash_filter_enabled': crash_filter_enabled,
@@ -901,6 +920,23 @@ def get_strategy_params():
 
 def render_latest_holding_page():
     st.title("🔔 最新持仓信号")
+    
+    # Hidden Link Button
+    st.markdown("""
+    <style>
+    .stButton button {
+        width: 100%;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    col_a, col_b = st.columns([0.8, 0.2])
+    with col_b:
+        # Use a generic label and open in new tab via JS to "hide" URL in status bar partially
+        # But Streamlit link_button shows URL. 
+        # To truly hide, we can use a small hack or just a generic link text.
+        # "External Resource"
+        st.link_button("🌐 外部数据源", "https://168.nbjiadao.com/")
     
     # Sidebar
     params = get_strategy_params()
@@ -1617,7 +1653,7 @@ def render_backtest_page():
 
 # --- Main App Logic ---
 st.sidebar.title("导航")
-page = st.sidebar.radio("选择页面", ["回测系统", "最新持仓标的", "策略介绍"])
+page = st.sidebar.radio("选择页面", ["回测系统", "最新持仓标的", "策略介绍"], index=0)
 
 if page == "回测系统":
     render_backtest_page()
