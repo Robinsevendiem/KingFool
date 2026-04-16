@@ -246,9 +246,12 @@ with tab2:
             secondary_y=True
         )
         
-        # Add Threshold Lines
-        fig_ts.add_hline(y=300, line_dash="dash", line_color="orange", secondary_y=True, annotation_text="300")
-        fig_ts.add_hline(y=700, line_dash="dash", line_color="red", secondary_y=True, annotation_text="700")
+        # Add Threshold Lines based on user interest (0.4, 5, 10, etc.)
+        fig_ts.add_hline(y=0.4, line_dash="dot", line_color="green", secondary_y=True, annotation_text="0.4分", opacity=0.5)
+        fig_ts.add_hline(y=5, line_dash="dot", line_color="purple", secondary_y=True, annotation_text="5分", opacity=0.5)
+        fig_ts.add_hline(y=10, line_dash="dot", line_color="blue", secondary_y=True, annotation_text="10分", opacity=0.5)
+        fig_ts.add_hline(y=300, line_dash="dash", line_color="orange", secondary_y=True, annotation_text="300分 (熔断区)")
+        fig_ts.add_hline(y=600, line_dash="dash", line_color="red", secondary_y=True, annotation_text="600分 (极度危险)")
         
         fig_ts.update_layout(
             title=f"{target_asset}: 价格与动量得分走势对比",
@@ -258,7 +261,7 @@ with tab2:
         )
         
         # Toggle for fixed range
-        use_fixed_range = st.checkbox("锁定右轴范围 (0-1000)", value=False, help="勾选后，右轴将固定显示 0-1000，方便对比绝对热度；取消勾选则自动缩放，方便查看得分为低值时的波动细节。")
+        use_fixed_range = st.checkbox("锁定右轴范围 (0-1000)", value=False, help="勾选后，右轴将固定显示 0-1000，方便对比绝对热度；取消勾选则自动缩放，方便查看得分为低值（如 0.4, 5, 10分）时的波动细节。")
         
         # Optimize Y-Axes
         # Left Axis (Price) - Force auto range based on data
@@ -284,27 +287,33 @@ with tab2:
             showgrid=True,
         )
         
-        if use_fixed_range:
-            y2_config['range'] = [0, max(1000, df_single['Score'].max() * 1.1)]
-            y2_config['rangemode'] = "tozero"
-        else:
-            # Auto range for score too
-            min_score = df_single['Score'].min()
-            max_score = df_single['Score'].max()
-            # If min_score is close to 0, use 0. If negative (unlikely for this logic), follow data.
-            # But usually score >= 0.
-            # Let's give it some padding too.
-            score_padding = (max_score - min_score) * 0.1 if max_score > min_score else 10
-            y2_config['range'] = [max(0, min_score - score_padding), max_score + score_padding]
+        # Interactive Range Slider for Score Axis
+        st.markdown("**调整得分轴显示范围**")
+        col_slider1, col_slider2 = st.columns([3, 1])
+        with col_slider1:
+            score_max_limit = float(df_single['Score'].max() * 1.1)
+            # Slider to set max y-axis for score. This allows user to zoom into any specific score range easily.
+            max_score_display = st.slider("最高显示得分", min_value=1.0, max_value=max(1000.0, score_max_limit), value=score_max_limit, step=10.0, help="拖动滑块可以放大查看特定得分区域（如 0-20, 0-50, 0-200）对应的价格曲线形态。")
+        
+        y2_config['range'] = [0, max_score_display]
+        y2_config['rangemode'] = "tozero"
             
         fig_ts.update_yaxes(**y2_config)
         
         st.plotly_chart(fig_ts, use_container_width=True)
         
         st.info("""
-        **观察要点**:
-        1. **见顶信号**: 观察得分是否在价格见顶前率先飙升到 >300 或 >700 的极端区域？
-        2. **背离**: 价格还在涨，但得分开始下降（量价背离），往往是趋势强弩之末的信号。
+        **🔍 动量得分与价格形态对应关系指南**:
+        通过拖动上方滑块，您可以将视线聚焦在不同的得分层级：
+        
+        *   **[0 - 10分] 底部与试探期**：
+            价格通常处于**长期横盘震荡**或**刚刚止跌企稳**。此时 R² 极低，均线缠绕。偶尔的脉冲式上涨会让得分突破 5 分，这是右侧潜伏的极佳观察点。
+        *   **[10 - 50分] 趋势确立期**：
+            价格开始走出**清晰的上升通道**，均线多头排列。此时是趋势最健康的阶段，策略在此区间内买入并持有的胜率和盈亏比极高。
+        *   **[50 - 200分] 主升浪爆发期**：
+            价格出现**加速上涨**，斜率变陡。这是动量策略获取超额收益的核心区域。但此时买入可能面临短期回调的风险。
+        *   **[> 300分] 狂热与过热期**：
+            价格呈**指数级飙升**，脱离了正常估值轨道。虽然可能继续疯涨，但随时面临均值回归的暴跌。这就是我们设置“熔断阈值”的原因。
         """)
 
 # ----------------- Tab 3: Return Analysis (The Inverted U) -----------------

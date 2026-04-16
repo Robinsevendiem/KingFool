@@ -1,10 +1,14 @@
 import tushare as ts
 import pandas as pd
 import time
+import os
 from datetime import datetime, timedelta
 
 # Configuration
-TOKEN = 'e5e7ab8532e5d39159a7a47fe439348a68844653e1b9cf5b1f7426ea'
+TOKEN = os.getenv("TUSHARE_TOKEN", "").strip()
+if not TOKEN:
+    raise ValueError("请先设置环境变量 TUSHARE_TOKEN，再运行该脚本。")
+
 ts.set_token(TOKEN)
 pro = ts.pro_api()
 

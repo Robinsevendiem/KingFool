@@ -154,6 +154,23 @@ def update_data(token, force=False):
     
     return True
 
+def get_tushare_token():
+    """
+    Read Tushare token from Streamlit secrets or sidebar session override.
+    """
+    ts_token = ""
+
+    try:
+        if "TUSHARE_TOKEN" in st.secrets:
+            ts_token = st.secrets["TUSHARE_TOKEN"]
+    except:
+        pass
+
+    if 'tushare_token' in st.session_state and st.session_state['tushare_token']:
+        ts_token = st.session_state['tushare_token']
+
+    return ts_token
+
 # --- 1. Data Loading ---
 
 @st.cache_data
@@ -929,16 +946,7 @@ def get_strategy_params():
     st.sidebar.divider()
     st.sidebar.subheader("📥 数据更新")
     
-    # Try to get token from secrets, otherwise use default (or empty)
-    # Ideally, users should set .streamlit/secrets.toml or Streamlit Cloud secrets
-    default_token = "e5e7ab8532e5d39159a7a47fe439348a68844653e1b9cf5b1f7426ea"
-    ts_token = default_token
-    
-    try:
-        if "TUSHARE_TOKEN" in st.secrets:
-            ts_token = st.secrets["TUSHARE_TOKEN"]
-    except:
-        pass
+    ts_token = get_tushare_token()
         
     # Allow manual override
     manual_token = st.sidebar.text_input("Tushare Token (可选)", value="", type="password", help="如果自动获取失败，请在此手动输入 Token")
@@ -1124,27 +1132,9 @@ def render_latest_holding_page():
     
     if st.button("🔍 检查并获取最新信号", type="primary"):
         # 1. Update Data
-        default_token = "e5e7ab8532e5d39159a7a47fe439348a68844653e1b9cf5b1f7426ea"
-        ts_token = default_token
-        try:
-            if "TUSHARE_TOKEN" in st.secrets:
-                ts_token = st.secrets["TUSHARE_TOKEN"]
-        except:
-            pass
-        
-        # Check sidebar override (params are loaded from sidebar)
-        # But get_strategy_params runs in sidebar and returns params dict.
-        # It doesn't return the token.
-        # So we can't easily access the manual token from sidebar here unless we store it in session state.
-        
-        # Let's add session state logic for token
-        if 'tushare_token' in st.session_state and st.session_state['tushare_token']:
-             ts_token = st.session_state['tushare_token']
+        ts_token = get_tushare_token()
         
         with st.spinner("正在同步最新市场数据..."):
-            if 'tushare_token' in st.session_state and st.session_state['tushare_token']:
-                 ts_token = st.session_state['tushare_token']
-            
             # Default to incremental update for "Latest Holding" check
             update_data(ts_token, force=False)
             load_history_data.clear()
@@ -1619,26 +1609,6 @@ def render_backtest_page():
             # Resample
             df_daily = df_res[['value']].copy()
             df_daily['return'] = df_daily['value'].pct_change()
-            
-            # Monthly
-            monthly_ret = df_daily['value'].resample('M').last().pct_change()
-            monthly_ret.iloc[0] = df_daily['value'].iloc[0] / run_params['initial_capital'] - 1 
-            # Better: Monthly return = End / Start - 1
-            monthly_groups = df_daily.groupby(pd.Grouper(freq='M'))
-            monthly_data = []
-            for date, group in monthly_groups:
-                if not group.empty:
-                    start_val = group['value'].iloc[0]
-                    # If it's the very first month, start from initial capital? 
-                    # Actually, previous month end.
-                    # Let's use simple pct_change on resampled end-of-month values
-                    pass
-            
-            # Standard way: Resample last price, then pct_change
-            # But we need to handle the very first period correctly relative to initial capital or previous close.
-            
-            # Let's construct a daily series including start date-1 with initial capital if needed?
-            # Or just use the daily returns and compound them.
             
             # Heatmap Data Construction
             # Year on Y-axis, Month on X-axis
