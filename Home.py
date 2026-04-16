@@ -311,9 +311,133 @@ def precalculate_all_rsrs(history_data):
             all_rsrs = pd.merge(all_rsrs, rsrs, left_index=True, right_index=True, how='outer')
     return all_rsrs
 
+# --- Alpha Factors ---
+
+@st.cache_data
+def calculate_alpha51(df, window=10, threshold=0.01):
+    """
+    Alpha 51: Trend Deceleration Identification Factor
+    Generalized: If (Prev_10d_Return - Curr_10d_Return) < -Threshold, Signal=1 (Risk).
+    This means Current Rally is WEAKER than Previous Rally by 'Threshold'.
+    """
+    # Use adjusted close if available
+    if 'adj_close' in df.columns:
+        c = df['adj_close']
+    else:
+        c = df['close']
+        
+    w = window
+    
+    # Part 1: Previous Rally Speed (Price[t-2w] to Price[t-w])
+    # Note: Using (New - Old) / w for positive speed
+    speed_prev = (c.shift(w) - c.shift(2*w)) / w
+    
+    # Part 2: Current Rally Speed (Price[t-w] to Price[t])
+    speed_curr = (c - c.shift(w)) / w
+    
+    # Diff = Speed_Curr - Speed_Prev
+    # If Diff < -Threshold, it means Speed_Curr is significantly less than Speed_Prev -> Deceleration
+    diff = speed_curr - speed_prev
+    
+    cond = diff < -threshold
+    
+    # Return boolean series (True = Risk/Signal)
+    return cond
+
+@st.cache_data
+def precalculate_alpha51_all(history_data, window=10, threshold=0.01):
+    all_a51 = pd.DataFrame()
+    for asset, df in history_data.items():
+        # Returns boolean Series
+        a51 = calculate_alpha51(df, window, threshold)
+        a51.name = asset
+        all_a51 = pd.merge(all_a51, a51, left_index=True, right_index=True, how='outer')
+    return all_a51
+
+@st.cache_data
+def calculate_alpha55(history_data):
+    """
+    Alpha 55: Price-Volume Relation Factor
+    Formula: -1 * correlation(rank((close - ts_min(low, 12)) / (ts_max(high, 12) - ts_min(low, 12))), rank(volume), 6)
+    Note: Requires cross-sectional ranking across all assets.
+    """
+    # 1. Prepare DataFrames for Close, High, Low, Volume
+    closes = pd.DataFrame()
+    highs = pd.DataFrame()
+    lows = pd.DataFrame()
+    volumes = pd.DataFrame()
+    
+    for asset, df in history_data.items():
+        # Prefer adjusted for price, but volume is usually raw (or adjusted volume)
+        # Tushare 'vol' is volume.
+        
+        if 'adj_close' in df.columns: c = df['adj_close']
+        else: c = df['close']
+            
+        if 'adj_high' in df.columns: h = df['adj_high']
+        else: h = df['high']
+            
+        if 'adj_low' in df.columns: l = df['adj_low']
+        else: l = df['low']
+        
+        if 'vol' in df.columns: v = df['vol']
+        elif 'volume' in df.columns: v = df['volume']
+        else: v = pd.Series(np.nan, index=df.index)
+            
+        c.name = asset
+        h.name = asset
+        l.name = asset
+        v.name = asset
+        
+        closes = pd.merge(closes, c, left_index=True, right_index=True, how='outer')
+        highs = pd.merge(highs, h, left_index=True, right_index=True, how='outer')
+        lows = pd.merge(lows, l, left_index=True, right_index=True, how='outer')
+        volumes = pd.merge(volumes, v, left_index=True, right_index=True, how='outer')
+        
+    # 2. Calculate K term
+    # (close - ts_min(low, 12)) / (ts_max(high, 12) - ts_min(low, 12))
+    
+    ll12 = lows.rolling(12).min()
+    hh12 = highs.rolling(12).max()
+    
+    denom = hh12 - ll12
+    # Avoid division by zero
+    denom = denom.replace(0, np.nan)
+    
+    K = (closes - ll12) / denom
+    
+    # 3. Rank K (Cross-sectional)
+    # axis=1 means rank across columns (assets) for each row (date)
+    # pct=True to normalize to 0-1
+    rank_K = K.rank(axis=1, pct=True)
+    
+    # 4. Rank Volume (Cross-sectional)
+    rank_V = volumes.rank(axis=1, pct=True)
+    
+    # 5. Rolling Correlation (Time-series)
+    # correlation(rank_K, rank_V, 6)
+    # For each asset (column), calculate rolling corr of its rank series
+    
+    alpha55 = rank_K.rolling(6).corr(rank_V)
+    
+    # Multiply by -1
+    alpha55 = alpha55 * -1
+    
+    return alpha55
+
+@st.cache_data
+def precalculate_alpha51_all(history_data, window=10, threshold=0.01):
+    all_a51 = pd.DataFrame()
+    for asset, df in history_data.items():
+        # Returns boolean Series
+        a51 = calculate_alpha51(df, window, threshold)
+        a51.name = asset
+        all_a51 = pd.merge(all_a51, a51, left_index=True, right_index=True, how='outer')
+    return all_a51
+
 # --- 2. Backtest Logic ---
 
-def run_backtest(history_data, raw_scores_df, params):
+def run_backtest(history_data, raw_scores_df, params, alpha51_df=None):
     """
     params: {
         'start_date': datetime,
@@ -324,7 +448,9 @@ def run_backtest(history_data, raw_scores_df, params):
         'initial_capital': float,
         'crash_filter_enabled': bool,
         'crash_window': int,
-        'crash_threshold': float
+        'crash_threshold': float,
+        'exclude_overheated_from_norm': bool,
+        'use_alpha51': bool
     }
     """
     # Filter Timeline
@@ -530,6 +656,28 @@ def run_backtest(history_data, raw_scores_df, params):
                             valid_after_crash.append(asset)
                     
                     valid_assets_pool = valid_after_crash
+                
+                # 1.5 Apply Alpha 51 Filter (If Enabled)
+                # If Alpha 51 signal is True (Risk), exclude from pool.
+                if params.get('use_alpha51', False) and alpha51_df is not None:
+                    valid_after_a51 = []
+                    # Check if date exists in alpha51_df
+                    if date in alpha51_df.index:
+                        a51_today = alpha51_df.loc[date]
+                        for asset in valid_assets_pool:
+                            # Check risk signal
+                            is_risk = False
+                            if asset in a51_today and a51_today[asset] == True:
+                                is_risk = True
+                            
+                            if not is_risk:
+                                valid_after_a51.append(asset)
+                    else:
+                        # If no alpha data, keep as is (or strict mode?)
+                        # Keep as is for now
+                        valid_after_a51 = valid_assets_pool
+                    
+                    valid_assets_pool = valid_after_a51
                 
                 # Filter scores to valid pool
                 pool_scores = today_scores[today_scores.index.isin(valid_assets_pool)]
@@ -821,11 +969,37 @@ def get_strategy_params():
     min_date = pd.Timestamp('2017-08-01')
     max_date = pd.Timestamp.now()
     
-    start_date = st.sidebar.date_input("开始日期", min_date, min_value=min_date, max_value=max_date)
-    end_date = st.sidebar.date_input("结束日期", max_date, min_value=min_date, max_value=max_date)
-    
-    start_date = pd.Timestamp(start_date)
-    end_date = pd.Timestamp(end_date)
+    st.sidebar.subheader("📅 回测时间设置")
+    time_range_option = st.sidebar.radio(
+        "选择回测时长",
+        ("最近1年", "最近2年", "最近3年", "最近4年", "最近5年", "自定义时间范围"),
+        index=0
+    )
+
+    if time_range_option == "自定义时间范围":
+        start_date = st.sidebar.date_input("开始日期", min_date, min_value=min_date, max_value=max_date)
+        end_date = st.sidebar.date_input("结束日期", max_date, min_value=min_date, max_value=max_date)
+        start_date = pd.Timestamp(start_date)
+        end_date = pd.Timestamp(end_date)
+    else:
+        # Calculate start date based on selection
+        end_date = pd.Timestamp.now()
+        years_map = {
+            "最近1年": 1,
+            "最近2年": 2,
+            "最近3年": 3,
+            "最近4年": 4,
+            "最近5年": 5
+        }
+        years_back = years_map[time_range_option]
+        start_date = end_date - pd.DateOffset(years=years_back)
+        
+        # If calculated start date is before min_date, clamp it
+        if start_date < min_date:
+            start_date = min_date
+            
+        # Display the calculated range for info
+        st.sidebar.caption(f"范围: {start_date.strftime('%Y-%m-%d')} 至 {end_date.strftime('%Y-%m-%d')}")
     
     # Strategy Params
     st.sidebar.subheader("核心参数")
@@ -904,6 +1078,10 @@ def get_strategy_params():
     fee_rate = st.sidebar.number_input("交易费率 (%)", min_value=0.0, max_value=1.0, value=0.05, step=0.01) / 100
     initial_capital = st.sidebar.number_input("初始资金", min_value=10000, value=100000, step=10000)
     
+    # Alpha Factors
+    st.sidebar.subheader("Alpha 因子增强")
+    use_alpha51 = st.sidebar.checkbox("启用 Alpha 51 (趋势减速识别)", value=False, help="如果启用，当识别到标的上涨趋势明显减速时（涨速差 > 1%），将禁止开仓或强制平仓。")
+    
     return {
         'start_date': start_date,
         'end_date': end_date,
@@ -916,6 +1094,7 @@ def get_strategy_params():
         'crash_filter_enabled': crash_filter_enabled,
         'crash_window': crash_window,
         'crash_threshold': crash_threshold,
+        'use_alpha51': use_alpha51
     }
 
 def render_latest_holding_page():
@@ -977,6 +1156,12 @@ def render_latest_holding_page():
             scores_df = precalculate_all_scores(history_data, window=params['window'])
             rsrs_df = precalculate_all_rsrs(history_data)
             
+            # Alpha 51
+            if params.get('use_alpha51', False):
+                alpha51_df = precalculate_alpha51_all(history_data, window=10, threshold=0.01)
+            else:
+                alpha51_df = None
+            
             # 3. Run Backtest to determine state
             # We run from a reasonable past date to ensure state is correct
             # Start from 2024-01-01 or params['start_date']? 
@@ -984,7 +1169,7 @@ def render_latest_holding_page():
             backtest_params = params.copy()
             backtest_params['end_date'] = pd.Timestamp.now() # Ensure we go up to today
             
-            df_res, df_trades, timeline, last_signal = run_backtest(history_data, scores_df, backtest_params)
+            df_res, df_trades, timeline, last_signal = run_backtest(history_data, scores_df, backtest_params, alpha51_df)
             
             if not timeline:
                 st.error("无法计算信号，请检查数据或日期范围。")
@@ -1145,8 +1330,14 @@ def render_backtest_page():
             # Pre-calculate scores based on window
             scores_df = precalculate_all_scores(history_data, window=params['window'])
             
+            # Alpha 51
+            if params.get('use_alpha51', False):
+                alpha51_df = precalculate_alpha51_all(history_data, window=10, threshold=0.01)
+            else:
+                alpha51_df = None
+            
         with st.spinner("正在执行回测..."):
-            df_res, df_trades, timeline, last_signal = run_backtest(history_data, scores_df, params)
+            df_res, df_trades, timeline, last_signal = run_backtest(history_data, scores_df, params, alpha51_df)
             
             # Store results in session state
             st.session_state['bt_results'] = {
