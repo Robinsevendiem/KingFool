@@ -8,6 +8,7 @@ import warnings
 import tushare as ts
 import time
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 warnings.filterwarnings('ignore')
 
@@ -22,6 +23,10 @@ def update_data(token, force=False):
     Update ETF data using Tushare.
     force: If True, re-download all data from scratch.
     """
+    if not token:
+        st.error("未检测到 Tushare Token，无法更新数据。")
+        return False
+
     try:
         ts.set_token(token)
         pro = ts.pro_api(token)
@@ -46,7 +51,17 @@ def update_data(token, force=False):
     log_area = st.empty()
     logs = []
 
-    today = datetime.now().strftime('%Y%m%d')
+    # Use Shanghai timezone and latest open trade date to avoid server timezone drift.
+    sh_now = datetime.now(ZoneInfo("Asia/Shanghai"))
+    calendar_end = sh_now.strftime('%Y%m%d')
+    today = calendar_end
+    try:
+        cal_start = (sh_now - timedelta(days=31)).strftime('%Y%m%d')
+        trade_cal = pro.trade_cal(exchange='', start_date=cal_start, end_date=calendar_end, is_open='1')
+        if trade_cal is not None and not trade_cal.empty:
+            today = str(trade_cal['cal_date'].max())
+    except Exception as e:
+        logs.append(f"交易日历获取失败，回退到自然日 {calendar_end}: {e}")
     
     total_etfs = len(etfs)
     
@@ -139,9 +154,10 @@ def update_data(token, force=False):
                     
                     df_final['trade_date'] = df_final['trade_date'].dt.strftime('%Y%m%d')
                     df_final.to_csv(filename, index=False, encoding='utf-8-sig')
-                    logs.append(f"{name}: 更新了 {len(df_new)} 条记录。")
+                    latest_saved_date = df_final['trade_date'].max()
+                    logs.append(f"{name}: 更新了 {len(df_new)} 条记录，最新日期 {latest_saved_date}。")
                 else:
-                    logs.append(f"{name}: 无新数据。")
+                    logs.append(f"{name}: 无新数据（当前按最近开放交易日 {today} 检查）。")
             except Exception as e:
                 logs.append(f"{name} 更新失败: {e}")
         
@@ -165,6 +181,9 @@ def get_tushare_token():
             ts_token = st.secrets["TUSHARE_TOKEN"]
     except:
         pass
+
+    if not ts_token:
+        ts_token = os.getenv("TUSHARE_TOKEN", "").strip()
 
     if 'tushare_token' in st.session_state and st.session_state['tushare_token']:
         ts_token = st.session_state['tushare_token']
@@ -205,6 +224,16 @@ def load_history_data():
             except Exception as e:
                 st.error(f"Error loading {filename}: {e}")
     return history_data
+
+def filter_history_data(history_data, selected_assets):
+    """
+    Filter history_data by asset names.
+    selected_assets: list[str] | None
+    """
+    if not selected_assets:
+        return {}
+    selected_set = set(selected_assets)
+    return {k: v for k, v in history_data.items() if k in selected_set}
 
 @st.cache_data
 def calculate_rolling_scores(series, window=20):
@@ -470,6 +499,16 @@ def run_backtest(history_data, raw_scores_df, params, alpha51_df=None):
         'use_alpha51': bool
     }
     """
+    # Apply user-selected universe (if provided) to keep pool consistent across history/prices/scores.
+    selected_assets = params.get('selected_assets', None)
+    if selected_assets:
+        history_data = filter_history_data(history_data, selected_assets)
+        keep_cols = [c for c in raw_scores_df.columns if c in set(selected_assets)]
+        raw_scores_df = raw_scores_df[keep_cols] if keep_cols else raw_scores_df.iloc[:, 0:0]
+        if alpha51_df is not None:
+            keep_a51_cols = [c for c in alpha51_df.columns if c in set(selected_assets)]
+            alpha51_df = alpha51_df[keep_a51_cols] if keep_a51_cols else alpha51_df.iloc[:, 0:0]
+
     # Filter Timeline
     timeline = [d for d in raw_scores_df.index if params['start_date'] <= d <= params['end_date']]
     timeline = sorted(timeline)
@@ -968,6 +1007,8 @@ def get_strategy_params():
                 # Clear cache to force reload
                 load_history_data.clear()
                 precalculate_all_scores.clear()
+                precalculate_all_rsrs.clear()
+                precalculate_alpha51_all.clear()
                 st.rerun()
     
     st.sidebar.divider()
@@ -1013,6 +1054,27 @@ def get_strategy_params():
     st.sidebar.subheader("核心参数")
     
     window = st.sidebar.number_input("动量窗口 (天)", min_value=5, max_value=60, value=20, step=1)
+
+    # Universe selection
+    st.sidebar.subheader("标的池")
+    code_to_name_all = {
+        '588120.SH': '科创板',
+        '513100.SH': '纳指100',
+        '513520.SH': '日经ETF',
+        '159915.SZ': '创业板',
+        '513020.SH': '港股科技',
+        '510180.SH': '上证180',
+        '518880.SH': '黄金ETF',
+        '501018.SH': '南方原油',
+        '511090.SH': '30年国债'
+    }
+    universe_all = list(code_to_name_all.values())
+    selected_assets = st.sidebar.multiselect(
+        "参与轮动的标的",
+        options=universe_all,
+        default=universe_all,
+        help="未勾选的标的不会参与动量评分、过滤、归一化与换仓决策。"
+    )
     
     # Custom Cutoff Logic
     st.sidebar.markdown("**过热熔断阈值设置**")
@@ -1027,17 +1089,7 @@ def get_strategy_params():
     user_cutoffs = {}
     
     # Map code to friendly name for display
-    code_to_name = {
-        '588120.SH': '科创板',
-        '513100.SH': '纳指100',
-        '513520.SH': '日经ETF',
-        '159915.SZ': '创业板',
-        '513020.SH': '港股科技',
-        '510180.SH': '上证180',
-        '518880.SH': '黄金ETF',
-        '501018.SH': '南方原油',
-        '511090.SH': '30年国债'
-    }
+    code_to_name = {code: name for code, name in code_to_name_all.items() if name in set(selected_assets)}
 
     if cutoff_mode == "全局统一设置":
         global_cutoff = st.sidebar.number_input("全局熔断阈值", min_value=50, max_value=2000, value=600, step=50)
@@ -1094,6 +1146,7 @@ def get_strategy_params():
         'start_date': start_date,
         'end_date': end_date,
         'window': window,
+        'selected_assets': selected_assets,
         'user_cutoffs': user_cutoffs,
         'buffer_score': buffer_score,
         'exclude_overheated_from_norm': exclude_overheated_from_norm,
@@ -1127,6 +1180,10 @@ def render_latest_holding_page():
     
     # Sidebar
     params = get_strategy_params()
+
+    if not params.get('selected_assets'):
+        st.warning("请至少选择一个参与轮动的标的。")
+        return
     
     st.info("点击下方按钮，系统将获取最新数据，并根据当前策略参数计算下一个交易日的建议持仓。")
     
@@ -1139,10 +1196,12 @@ def render_latest_holding_page():
             update_data(ts_token, force=False)
             load_history_data.clear()
             precalculate_all_scores.clear()
+            precalculate_all_rsrs.clear()
+            precalculate_alpha51_all.clear()
             
         # 2. Load & Calc
         with st.spinner("正在计算策略信号..."):
-            history_data = load_history_data()
+            history_data = filter_history_data(load_history_data(), params.get('selected_assets'))
             scores_df = precalculate_all_scores(history_data, window=params['window'])
             rsrs_df = precalculate_all_rsrs(history_data)
             
@@ -1311,9 +1370,13 @@ def calculate_thermometer(df):
 def render_backtest_page():
     # Sidebar Controls
     params = get_strategy_params()
+
+    if not params.get('selected_assets'):
+        st.warning("请至少选择一个参与轮动的标的。")
+        return
     
     # Data Loading
-    history_data = load_history_data()
+    history_data = filter_history_data(load_history_data(), params.get('selected_assets'))
     
     if st.sidebar.button("🚀 开始回测", type="primary"):
         with st.spinner("正在计算动量得分..."):
