@@ -1,0 +1,10 @@
+[
+  {
+    "code": "600519.SH",
+    "name": "贵州茅台",
+    "start_date": "20010827",
+    "asset_type": "E",
+    "file_path": "data/custom/600519.SH_贵州茅台_history.csv",
+    "source": "stock"
+  }
+]

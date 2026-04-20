@@ -2,6 +2,8 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import os
+import json
+import re
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import warnings
@@ -16,6 +18,18 @@ warnings.filterwarnings('ignore')
 st.set_page_config(page_title="ETF 动量策略回测系统", layout="wide", page_icon="📈")
 
 import statsmodels.api as sm
+
+BUILTIN_ASSETS = [
+    {'code': '513520.SH', 'name': '日经ETF', 'start_date': '20190612', 'asset_type': 'FD', 'file_path': 'data/513520.SH_日经ETF_history.csv'},
+    {'code': '513100.SH', 'name': '纳指100', 'start_date': '20130515', 'asset_type': 'FD', 'file_path': 'data/513100.SH_纳指ETF_history.csv', 'aliases': ['纳指ETF']},
+    {'code': '513020.SH', 'name': '港股科技', 'start_date': '20220127', 'asset_type': 'FD', 'file_path': 'data/513020.SH_港股科技ETF_history.csv', 'aliases': ['港股科技ETF']},
+    {'code': '510180.SH', 'name': '上证180', 'start_date': '20060518', 'asset_type': 'FD', 'file_path': 'data/510180.SH_180ETF_history.csv', 'aliases': ['180ETF']},
+    {'code': '588120.SH', 'name': '科创板', 'start_date': '20230908', 'asset_type': 'FD', 'file_path': 'data/588120.SH_科创板ETF_history.csv', 'aliases': ['科创板ETF']},
+    {'code': '159915.SZ', 'name': '创业板', 'start_date': '20111209', 'asset_type': 'FD', 'file_path': 'data/159915.SZ_创业板ETF_history.csv', 'aliases': ['创业板ETF']},
+    {'code': '501018.SH', 'name': '南方原油', 'start_date': '20160624', 'asset_type': 'FD', 'file_path': 'data/501018.SH_南方原油(LOF)_history.csv', 'aliases': ['南方原油(LOF)']},
+    {'code': '518880.SH', 'name': '黄金ETF', 'start_date': '20130729', 'asset_type': 'FD', 'file_path': 'data/518880.SH_黄金ETF_history.csv'},
+    {'code': '511090.SH', 'name': '30年国债', 'start_date': '20230613', 'asset_type': 'FD', 'file_path': 'data/511090.SH_30年国债ETF_history.csv', 'aliases': ['30年国债ETF']},
+]
 
 # --- Helper: Data Update ---
 def update_data(token, force=False):
@@ -34,18 +48,6 @@ def update_data(token, force=False):
         st.error(f"Tushare 初始化失败: {e}")
         return False
 
-    etfs = [
-        {'code': '513520.SH', 'name': '日经ETF', 'start_date': '20190612'},
-        {'code': '513100.SH', 'name': '纳指ETF', 'start_date': '20130515'},
-        {'code': '513020.SH', 'name': '港股科技ETF', 'start_date': '20220127'},
-        {'code': '510180.SH', 'name': '180ETF', 'start_date': '20060518'},
-        {'code': '588120.SH', 'name': '科创板ETF', 'start_date': '20230908'},
-        {'code': '159915.SZ', 'name': '创业板ETF', 'start_date': '20111209'},
-        {'code': '501018.SH', 'name': '南方原油(LOF)', 'start_date': '20160624'},
-        {'code': '518880.SH', 'name': '黄金ETF', 'start_date': '20130729'},
-        {'code': '511090.SH', 'name': '30年国债ETF', 'start_date': '20230613'},
-    ]
-
     progress_bar = st.progress(0)
     status_text = st.empty()
     log_area = st.empty()
@@ -63,17 +65,18 @@ def update_data(token, force=False):
     except Exception as e:
         logs.append(f"交易日历获取失败，回退到自然日 {calendar_end}: {e}")
     
-    total_etfs = len(etfs)
+    assets = get_all_assets_config()
+    total_assets = len(assets)
     
-    for i, etf in enumerate(etfs):
-        code = etf['code']
-        name = etf['name']
-        filename = f"data/{code}_{name}_history.csv"
+    for i, asset in enumerate(assets):
+        code = asset['code']
+        name = asset['name']
+        filename = asset['file_path']
         
         status_text.text(f"正在处理: {name} ({code})...")
         
         # Determine start date
-        start_date = etf['start_date']
+        start_date = asset['start_date']
         existing_df = None
         
         if not force and os.path.exists(filename):
@@ -102,9 +105,9 @@ def update_data(token, force=False):
                 for attempt in range(max_retries):
                     try:
                         # Fetch unadjusted
-                        df_raw = ts.pro_bar(ts_code=code, start_date=start_date, end_date=today, adj=None, asset='FD')
+                        df_raw = ts.pro_bar(ts_code=code, start_date=start_date, end_date=today, adj=None, asset=asset.get('asset_type', 'FD'))
                         # Fetch adjusted (qfq)
-                        df_adj = ts.pro_bar(ts_code=code, start_date=start_date, end_date=today, adj='qfq', asset='FD')
+                        df_adj = ts.pro_bar(ts_code=code, start_date=start_date, end_date=today, adj='qfq', asset=asset.get('asset_type', 'FD'))
                         
                         break # Success
                     except Exception as e:
@@ -152,6 +155,7 @@ def update_data(token, force=False):
                     # My update logic converted to datetime: df_new['trade_date'] = pd.to_datetime(...)
                     # So I should convert back to 'YYYYMMDD' string before saving to match original format.
                     
+                    os.makedirs(os.path.dirname(filename), exist_ok=True)
                     df_final['trade_date'] = df_final['trade_date'].dt.strftime('%Y%m%d')
                     df_final.to_csv(filename, index=False, encoding='utf-8-sig')
                     latest_saved_date = df_final['trade_date'].max()
@@ -161,7 +165,7 @@ def update_data(token, force=False):
             except Exception as e:
                 logs.append(f"{name} 更新失败: {e}")
         
-        progress_bar.progress((i + 1) / total_etfs)
+        progress_bar.progress((i + 1) / total_assets if total_assets > 0 else 1)
         time.sleep(0.1) # Be nice to API
         
     status_text.text("数据更新完成！")
@@ -190,23 +194,121 @@ def get_tushare_token():
 
     return ts_token
 
+def get_custom_assets_path():
+    return "data/custom_assets.json"
+
+def sanitize_filename_component(name):
+    return re.sub(r'[\\\\/:*?"<>|]+', '_', str(name)).strip().replace(' ', '')
+
+def load_custom_assets_config():
+    path = get_custom_assets_path()
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return data
+    except Exception:
+        pass
+    return []
+
+def save_custom_assets_config(assets):
+    os.makedirs("data", exist_ok=True)
+    with open(get_custom_assets_path(), 'w', encoding='utf-8') as f:
+        json.dump(assets, f, ensure_ascii=False, indent=2)
+
+def get_all_assets_config():
+    custom_assets = load_custom_assets_config()
+    merged = []
+    seen_codes = set()
+    for asset in BUILTIN_ASSETS + custom_assets:
+        code = asset.get('code')
+        if not code or code in seen_codes:
+            continue
+        seen_codes.add(code)
+        merged.append(asset)
+    return merged
+
+def get_asset_name_to_code_map():
+    mapping = {}
+    for asset in get_all_assets_config():
+        code = asset['code']
+        name = asset['name']
+        mapping[name] = code
+        for alias in asset.get('aliases', []):
+            mapping[alias] = code
+    return mapping
+
+def get_asset_code_to_name_map():
+    return {asset['code']: asset['name'] for asset in get_all_assets_config()}
+
+def resolve_asset_info(token, ts_code):
+    code = str(ts_code).strip().upper()
+    if not code:
+        raise ValueError("请输入有效代码。")
+
+    ts.set_token(token)
+    pro = ts.pro_api(token)
+
+    fund_df = pro.fund_basic(ts_code=code, market='E')
+    if fund_df is not None and not fund_df.empty:
+        row = fund_df.iloc[0]
+        list_date = str(row.get('list_date') or row.get('found_date') or '')
+        if not list_date or list_date == 'nan':
+            raise ValueError("该基金缺少上市日期，暂时无法加入标的池。")
+        name = str(row.get('name') or code)
+        safe_name = sanitize_filename_component(name)
+        return {
+            'code': code,
+            'name': name,
+            'start_date': list_date,
+            'asset_type': 'FD',
+            'file_path': f"data/custom/{code}_{safe_name}_history.csv",
+            'source': 'fund'
+        }
+
+    stock_df = pro.stock_basic(ts_code=code, fields='ts_code,name,list_date')
+    if stock_df is not None and not stock_df.empty:
+        row = stock_df.iloc[0]
+        list_date = str(row.get('list_date') or '')
+        if not list_date or list_date == 'nan':
+            raise ValueError("该股票缺少上市日期，暂时无法加入标的池。")
+        name = str(row.get('name') or code)
+        safe_name = sanitize_filename_component(name)
+        return {
+            'code': code,
+            'name': name,
+            'start_date': list_date,
+            'asset_type': 'E',
+            'file_path': f"data/custom/{code}_{safe_name}_history.csv",
+            'source': 'stock'
+        }
+
+    raise ValueError("Tushare 未识别该代码为场内基金/LOF/ETF或股票，请检查代码格式是否正确。")
+
+def add_custom_asset(token, ts_code):
+    if not token:
+        raise ValueError("未检测到 Tushare Token，无法新增标的。")
+
+    asset_info = resolve_asset_info(token, ts_code)
+    all_assets = get_all_assets_config()
+    if any(asset['code'] == asset_info['code'] for asset in all_assets):
+        return asset_info, False
+
+    custom_assets = load_custom_assets_config()
+    custom_assets.append(asset_info)
+    save_custom_assets_config(custom_assets)
+    return asset_info, True
+
 # --- 1. Data Loading ---
 
 @st.cache_data
 def load_history_data():
-    mapping = {
-        '创业板': 'data/159915.SZ_创业板ETF_history.csv',
-        '南方原油': 'data/501018.SH_南方原油(LOF)_history.csv',
-        '上证180': 'data/510180.SH_180ETF_history.csv',
-        '30年国债': 'data/511090.SH_30年国债ETF_history.csv',
-        '港股科技': 'data/513020.SH_港股科技ETF_history.csv',
-        '纳指100': 'data/513100.SH_纳指ETF_history.csv',
-        '日经ETF': 'data/513520.SH_日经ETF_history.csv',
-        '黄金ETF': 'data/518880.SH_黄金ETF_history.csv',
-        '科创板': 'data/588120.SH_科创板ETF_history.csv'
-    }
     history_data = {}
-    for name, filename in mapping.items():
+    for asset in get_all_assets_config():
+        name = asset['name']
+        filename = asset['file_path']
         if os.path.exists(filename):
             try:
                 df = pd.read_csv(filename)
@@ -744,17 +846,7 @@ def run_backtest(history_data, raw_scores_df, params, alpha51_df=None):
                     # 2. Filter Candidates (Score > 0 & <= Cutoff)
                     # Use Asset-Specific Cutoff
                     
-                    # We need to map asset name to code again to lookup config
-                    name_to_code = {
-                        '日经ETF': '513520.SH', '纳指ETF': '513100.SH', '港股科技ETF': '513020.SH', 
-                        '港股科技': '513020.SH', '纳指100': '513100.SH',
-                        '180ETF': '510180.SH', '上证180': '510180.SH',
-                        '科创板ETF': '588120.SH', '科创板': '588120.SH',
-                        '创业板ETF': '159915.SZ', '创业板': '159915.SZ',
-                        '南方原油(LOF)': '501018.SH', '南方原油': '501018.SH',
-                        '黄金ETF': '518880.SH', 
-                        '30年国债ETF': '511090.SH', '30年国债': '511090.SH'
-                    }
+                    name_to_code = params.get('asset_name_to_code', get_asset_name_to_code_map())
                     
                     def get_cutoff(asset_name):
                         code = name_to_code.get(asset_name)
@@ -1055,20 +1147,36 @@ def get_strategy_params():
     
     window = st.sidebar.number_input("动量窗口 (天)", min_value=5, max_value=60, value=20, step=1)
 
+    # Dynamic universe management
+    st.sidebar.subheader("新增标的")
+    new_asset_code = st.sidebar.text_input(
+        "输入股票/基金代码",
+        value="",
+        placeholder="例如 600519.SH / 513500.SH",
+        help="支持股票、ETF、LOF、场内基金代码，系统会自动识别类型并下载历史数据。"
+    )
+    if st.sidebar.button("➕ 添加标的", key="add_custom_asset_btn"):
+        try:
+            asset_info, created = add_custom_asset(ts_token, new_asset_code)
+            if created:
+                update_data(ts_token, force=False)
+                load_history_data.clear()
+                precalculate_all_scores.clear()
+                precalculate_all_rsrs.clear()
+                precalculate_alpha51_all.clear()
+                st.sidebar.success(f"已新增标的：{asset_info['name']} ({asset_info['code']})")
+                st.rerun()
+            else:
+                st.sidebar.info(f"标的已存在：{asset_info['name']} ({asset_info['code']})")
+        except Exception as e:
+            st.sidebar.error(f"新增失败：{e}")
+
+    asset_configs = get_all_assets_config()
+    code_to_name_all = {asset['code']: asset['name'] for asset in asset_configs}
+    universe_all = list(code_to_name_all.values())
+
     # Universe selection
     st.sidebar.subheader("标的池")
-    code_to_name_all = {
-        '588120.SH': '科创板',
-        '513100.SH': '纳指100',
-        '513520.SH': '日经ETF',
-        '159915.SZ': '创业板',
-        '513020.SH': '港股科技',
-        '510180.SH': '上证180',
-        '518880.SH': '黄金ETF',
-        '501018.SH': '南方原油',
-        '511090.SH': '30年国债'
-    }
-    universe_all = list(code_to_name_all.values())
     selected_assets = st.sidebar.multiselect(
         "参与轮动的标的",
         options=universe_all,
@@ -1111,7 +1219,7 @@ def get_strategy_params():
         
         with st.sidebar.expander("自定义各标的阈值", expanded=True):
             for code, name in code_to_name.items():
-                default_val = default_cutoffs.get(code, 300)
+                default_val = default_cutoffs.get(code, 600)
                 val = st.number_input(f"{name} ({code})", min_value=50, max_value=2000, value=default_val, step=50)
                 user_cutoffs[code] = val
             
@@ -1147,6 +1255,8 @@ def get_strategy_params():
         'end_date': end_date,
         'window': window,
         'selected_assets': selected_assets,
+        'asset_name_to_code': get_asset_name_to_code_map(),
+        'asset_code_to_name': get_asset_code_to_name_map(),
         'user_cutoffs': user_cutoffs,
         'buffer_score': buffer_score,
         'exclude_overheated_from_norm': exclude_overheated_from_norm,
@@ -1225,7 +1335,8 @@ def render_latest_holding_page():
                 return
 
             # 4. Display Result
-            latest_date = timeline[-1].strftime('%Y-%m-%d')
+            latest_idx = timeline[-1]
+            latest_date = latest_idx.strftime('%Y-%m-%d')
             next_holding = last_signal.get('next_holding', '现金')
             next_score = last_signal.get('score', 0)
             
@@ -1250,8 +1361,8 @@ def render_latest_holding_page():
             # Show details of candidates
             st.markdown("#### 📊 当日标的得分详情")
             
-            if latest_date in scores_df.index:
-                today_scores = scores_df.loc[latest_date].dropna().sort_values(ascending=False)
+            if latest_idx in scores_df.index:
+                today_scores = scores_df.loc[latest_idx].dropna().sort_values(ascending=False)
                 
                 # Format for display
                 details = []
@@ -1265,20 +1376,8 @@ def render_latest_holding_page():
                         # Let's just do a quick lookup
                         pass # Cutoff might be slightly off in display if we don't map, but acceptable for now or fix properly.
                         
-                    # Re-map for accurate cutoff display
-                    name_to_code_disp = {
-                        '日经ETF': '513520.SH', '纳指ETF': '513100.SH', '港股科技ETF': '513020.SH', 
-                        '港股科技': '513020.SH', '纳指100': '513100.SH',
-                        '180ETF': '510180.SH', '上证180': '510180.SH',
-                        '科创板ETF': '588120.SH', '科创板': '588120.SH',
-                        '创业板ETF': '159915.SZ', '创业板': '159915.SZ',
-                        '南方原油(LOF)': '501018.SH', '南方原油': '501018.SH',
-                        '黄金ETF': '518880.SH', 
-                        '30年国债ETF': '511090.SH', '30年国债': '511090.SH'
-                    }
-                    
                     cutoff_val = 300
-                    asset_code = name_to_code_disp.get(asset)
+                    asset_code = params.get('asset_name_to_code', get_asset_name_to_code_map()).get(asset)
                     if asset_code and 'user_cutoffs' in params and asset_code in params['user_cutoffs']:
                         cutoff_val = params['user_cutoffs'][asset_code]
                         
@@ -1290,8 +1389,8 @@ def render_latest_holding_page():
                         
                     # Get RSRS
                     rsrs_val = np.nan
-                    if latest_date in rsrs_df.index and asset in rsrs_df.columns:
-                        rsrs_val = rsrs_df.loc[latest_date, asset]
+                    if latest_idx in rsrs_df.index and asset in rsrs_df.columns:
+                        rsrs_val = rsrs_df.loc[latest_idx, asset]
                         
                     rsrs_str = f"{rsrs_val:.2f}" if not np.isnan(rsrs_val) else "-"
                     
@@ -1536,32 +1635,14 @@ def render_backtest_page():
             
             # --- NEW SECTION: Current Status Info ---
             # 1. Data Updated To
-            latest_data_date = timeline[-1].strftime('%Y-%m-%d')
+            latest_data_idx = timeline[-1]
+            latest_data_date = latest_data_idx.strftime('%Y-%m-%d')
             
             # 2. T+1 Holding
             next_holding = last_signal.get('next_holding', '未知')
             next_score = last_signal.get('score', 0)
             
-            # Map code if possible
-            etf_code_map = {
-                '日经ETF': '513520.SH',
-                '纳指ETF': '513100.SH',
-                '港股科技': '513020.SH', 
-                '港股科技ETF': '513020.SH',
-                '上证180': '510180.SH',
-                '180ETF': '510180.SH',
-                '科创板': '588120.SH',
-                '科创板ETF': '588120.SH',
-                '创业板': '159915.SZ',
-                '创业板ETF': '159915.SZ',
-                '南方原油': '501018.SH',
-                '南方原油(LOF)': '501018.SH',
-                '黄金ETF': '518880.SH',
-                '30年国债': '511090.SH',
-                '30年国债ETF': '511090.SH'
-            }
-            # Clean name for mapping
-            holding_code = etf_code_map.get(next_holding, '')
+            holding_code = run_params.get('asset_name_to_code', get_asset_name_to_code_map()).get(next_holding, '')
             if holding_code:
                 holding_display = f"{next_holding} ({holding_code})"
             else:
@@ -1573,8 +1654,8 @@ def render_backtest_page():
             # 4. Other Scores
             # We need scores for the last date in timeline
             other_scores_display = ""
-            if latest_data_date in scores_df.index:
-                today_scores = scores_df.loc[latest_data_date].dropna().sort_values(ascending=False)
+            if latest_data_idx in scores_df.index:
+                today_scores = scores_df.loc[latest_data_idx].dropna().sort_values(ascending=False)
                 # Filter out the winner to avoid duplication if desired, or show all
                 # Let's show top 5 others
                 score_strs = []
